@@ -1,24 +1,25 @@
-use std::{ffi::{CString, OsStr}, fs, path::Path/* , os::unix::fs::symlink */, process::Command};
+use std::{ffi::{CString, OsStr}, fs, path::Path};
 use anyhow::{anyhow, bail, Result};
 use nix::sched::{unshare, CloneFlags};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 
-fn get_derivation_path() -> Result<String> {
-    let subprocess = Command::new("nix-instantiate").arg("test/shell.nix").output()?;
-    if !subprocess.status.success() {
-        bail!("Unable to evaluate shell.nix: {:?}.", subprocess.stderr);
+fn subprocess(program: &str, args: &[&str]) -> Result<String> {
+    let mut command = std::process::Command::new(program);
+    for arg in args {
+        command.arg(arg);
     }
 
-    Ok(String::from_utf8(subprocess.stdout)?.trim().to_string())
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!("Error running {program} {}: {}.", args.join(" "), String::from_utf8(output.stderr.clone())?);
+    }
+
+    String::from_utf8(output.stdout).map_err(Into::into)
 }
 
 fn get_shell_hook(derivation_path: &str) -> Result<String> {
-    let subprocess = Command::new("nix").args(&["derivation", "show", &derivation_path]).output()?;
-    if !subprocess.status.success() {
-        bail!("Unable to open derivation: {:?}.", subprocess.stderr);
-    }
-    let derivation = serde_json::from_str::<serde_json::Value>(&String::from_utf8(subprocess.stdout)?)?;
-
+    let output = subprocess("nix", &["derivation", "show", &derivation_path])?;
+    let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
     let shell_hook = &derivation[&derivation_path]["env"]["shellHook"];
     shell_hook.as_str().map(str::to_owned).ok_or(anyhow!("Unable to parse derivation for shellHook."))
 }
@@ -82,18 +83,41 @@ fn create_ld_so_conf() -> Result<()> {
     fs::write(Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n")).map_err(Into::into)
 }
 
-fn main() -> Result<()> {
-    let derivation_path = &get_derivation_path()?;
-    let shell_hook = get_shell_hook(derivation_path)?;
+fn prepend_path() {
+    let additions = [
+        "/run/wrappers/bin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/bin",
+        "/sbin",
+    ];
+
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if !path.is_empty() {
+        path = ":".to_string() + &path;
+    }
+    std::env::set_var("PATH", additions.join(":") + &path);
+}
+
+fn get_fhs() -> Result<std::path::PathBuf> {
+    let shell_nix = &std::env::args().nth(1).ok_or(anyhow!("shell.nix path missing."))?;
+    let derivation_path = subprocess("nix-instantiate", &[shell_nix])?;
+    let shell_hook = get_shell_hook(derivation_path.trim())?;
 
     let pattern = regex::Regex::new(r"/nix/store/([^-]+)-(.+)-shell-env.drv")?;
-    let fhsenv_name = &pattern.captures(derivation_path)
+    let fhsenv_name = &pattern.captures(&derivation_path)
         .ok_or(anyhow!("Unable to parse derivation path for FHS environment name."))?[2];
 
     let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs", regex::escape(fhsenv_name)))?;
     let _match = pattern.find(&shell_hook).ok_or(anyhow!("Expected {pattern} to match shellHook."))?;
-    let fhs = Path::new(_match.as_str());
-    dbg!(fhs);
+
+    Ok(Path::new(_match.as_str()).into())
+}
+
+fn main() -> Result<()> {
+    let fhs = get_fhs()?;
 
     // TODO: does it matter whether user is root?
     // uid and guid before entering user namespace
@@ -105,27 +129,21 @@ fn main() -> Result<()> {
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)?;
 
     let sandbox = tempfile::TempDir::new()?.into_path();
-    dbg!(&sandbox);
     mount(None::<&str>, &sandbox, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
 
-    bind_entries(fhs, &sandbox, &["etc"])?;
+    bind_entries(&fhs, &sandbox, &["etc"])?;
     fs::create_dir(sandbox.join("etc"))?;
     // exclude login.defs and pam.d so to not mess with authentication
     bind_entries(&fhs.join("etc"), &sandbox.join("etc"), &["login.defs", "pam.d"])?;
-    // dbg!(sandbox.join("usr/include").read_dir()?.collect::<Result<Vec<_>, _>>()?);
 
     let root = Path::new("/");
     bind_entries(root, &sandbox, &["etc", "tmp"])?;     // TODO: explain why not mount tmp directly
     bind_entries(&root.join("etc"), &sandbox.join("etc"), &[])?;
 
     // indirectly join sandbox with tempdir since joining with an absolute path substitutes with it
-    // let put_old =
-    //     sandbox.join(tempfile::TempDir::new()?.into_path().components().skip(1).collect::<PathBuf>());
     let put_old = sandbox.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
-    dbg!(&put_old);
     fs::create_dir(sandbox.join("tmp"))?;
     bind_entries(&root.join("tmp"), &sandbox.join("tmp"), &[])?;
-    // dbg!(sandbox.join("var").read_dir()?.collect::<Result<Vec<_>, _>>()?);
 
     let cwd = std::env::current_dir()?;     // cwd before pivot_root
     nix::unistd::pivot_root(&sandbox, &put_old)?;
@@ -141,16 +159,9 @@ fn main() -> Result<()> {
     umount2(&put_old, MntFlags::MNT_DETACH)?;
     // dbg!(put_old.read_dir()?.collect::<Result<Vec<_>, _>>()?);
 
-    // extract glibc path via regex from shell_hook
-    // let pattern = regex::Regex::new(r"/nix/store/([^\s]+?)-glibc-[^/\s]+")?;
-    // let captures = pattern.find(&shell_hook).ok_or(anyhow!("Unable to find glibc path in shellHook."))?;
-    // let glibc_path = Path::new(captures.as_str());
-
-    // symlink /etc/ld.so.conf and /etc/ld.so.cache from glibc/etc
-    // symlink(glibc_path.join("etc/ld.so.conf"), sandbox.join("etc/ld.so.conf"))?;
-    // symlink(glibc_path.join("etc/ld.so.cache"), sandbox.join("etc/ld.so.cache"))?;
-
     create_ld_so_conf()?;
+    prepend_path();
 
+    // nix::unistd::execve(&CString::new("/bin/bash")?, &[CString::new("bash")?], &Vec::<CString>::new()).map(drop).map_err(Into::into)
     nix::unistd::execv(&CString::new("/bin/bash")?, &[CString::new("bash")?]).map(drop).map_err(Into::into)
 }
