@@ -1,16 +1,16 @@
-use std::{ffi::{CString, OsStr}, fs, path::Path};
+use std::{ffi::CString, fs, path::Path};
 use anyhow::{anyhow, bail, Result};
 use nix::sched::{unshare, CloneFlags};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 
-fn subprocess(program: &str, args: &[&str]) -> Result<String> {
+fn subprocess(program: &str, args: &[&str], check: bool) -> Result<String> {
     let mut command = std::process::Command::new(program);
     for arg in args {
         command.arg(arg);
     }
 
     let output = command.output()?;
-    if !output.status.success() {
+    if check && !output.status.success() {
         bail!("Error running {program} {}: {}.", args.join(" "), String::from_utf8(output.stderr.clone())?);
     }
 
@@ -18,7 +18,7 @@ fn subprocess(program: &str, args: &[&str]) -> Result<String> {
 }
 
 fn get_shell_hook(derivation_path: &str) -> Result<String> {
-    let output = subprocess("nix", &["derivation", "show", &derivation_path])?;
+    let output = subprocess("nix", &["derivation", "show", &derivation_path], true)?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
     let shell_hook = &derivation[&derivation_path]["env"]["shellHook"];
     shell_hook.as_str().map(str::to_owned).ok_or(anyhow!("Unable to parse derivation for shellHook."))
@@ -83,8 +83,16 @@ fn create_ld_so_conf() -> Result<()> {
     fs::write(Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n")).map_err(Into::into)
 }
 
-fn prepend_path() {
-    let additions = [
+fn prepend_entries_in_env(key: &str, additions: &[&str]) {
+    let mut val = std::env::var(key).unwrap_or_default();
+    if !val.is_empty() {
+        val = ":".to_string() + &val;
+    }
+    std::env::set_var(key, additions.join(":") + &val);
+}
+
+fn prepare_env() {
+    prepend_entries_in_env("PATH", &[
         "/run/wrappers/bin",
         "/usr/bin",
         "/usr/sbin",
@@ -92,18 +100,31 @@ fn prepend_path() {
         "/usr/local/sbin",
         "/bin",
         "/sbin",
-    ];
+    ]);
 
-    let mut path = std::env::var("PATH").unwrap_or_default();
-    if !path.is_empty() {
-        path = ":".to_string() + &path;
-    }
-    std::env::set_var("PATH", additions.join(":") + &path);
+    prepend_entries_in_env("PKG_CONFIG_PATH", &["/usr/lib/pkgconfig"]);
+
+    prepend_entries_in_env("LD_LIBRARY_PATH", &[
+        "/run/opengl-driver/lib",
+        "/run/opengl-driver-32/lib",
+    ]);
+
+    prepend_entries_in_env("XDG_DATA_DIRS", &[
+        "/run/opengl-driver/share",
+        "/run/opengl-driver-32/share",
+        "/usr/local/share",
+        "/usr/share",
+    ]);
+
+    prepend_entries_in_env("ACLOCAL_PATH", &["/usr/share/aclocal"]);
+
+    std::env::set_var("LOCALE_ARCHIVE", "/usr/lib/locale/locale-archive");
 }
 
 fn get_fhs() -> Result<std::path::PathBuf> {
     let shell_nix = &std::env::args().nth(1).ok_or(anyhow!("shell.nix path missing."))?;
-    let derivation_path = subprocess("nix-instantiate", &[shell_nix])?;
+    subprocess("nix-build", &[shell_nix], false)?;      // build the fhs environment
+    let derivation_path = subprocess("nix-instantiate", &[shell_nix], true)?;
     let shell_hook = get_shell_hook(derivation_path.trim())?;
 
     let pattern = regex::Regex::new(r"/nix/store/([^-]+)-(.+)-shell-env.drv")?;
@@ -149,19 +170,14 @@ fn main() -> Result<()> {
     nix::unistd::pivot_root(&sandbox, &put_old)?;
     std::env::set_current_dir(&cwd)?;       // reset cwd
 
-    // update put_old
-    let filename = put_old.file_name().map(OsStr::to_str).flatten()
-        .ok_or(anyhow!("TempDir initialized with invalid name: {:?}", put_old.file_name()))?;
-    let put_old = Path::new("/tmp").join(filename);
-
-    // mount(None::<&str>, put_old, None::<&str>, MsFlags::MS_PRIVATE, None::<&str>)?;
-    // dbg!(put_old.read_dir()?.collect::<Result<Vec<_>, _>>()?);
-    umount2(&put_old, MntFlags::MNT_DETACH)?;
-    // dbg!(put_old.read_dir()?.collect::<Result<Vec<_>, _>>()?);
+    // discard old root
+    umount2(&root.join(put_old.strip_prefix(sandbox)?), MntFlags::MNT_DETACH)?;
 
     create_ld_so_conf()?;
-    prepend_path();
+    prepare_env();
 
-    // nix::unistd::execve(&CString::new("/bin/bash")?, &[CString::new("bash")?], &Vec::<CString>::new()).map(drop).map_err(Into::into)
-    nix::unistd::execv(&CString::new("/bin/bash")?, &[CString::new("bash")?]).map(drop).map_err(Into::into)
+    std::env::set_var("PS1", r"\[\e[1;32m\]\u \W> \[\e[0m\]");      // make command prompt green
+    nix::unistd::execv(&CString::new("/bin/bash")?, &[CString::new("bash")?, CString::new("--norc")?])?;
+
+    Ok(())
 }
