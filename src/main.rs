@@ -35,10 +35,10 @@ fn map_user(uid: u32, gid: u32) -> Result<()> {
 }
 
 // TODO: is there a practical limit on number of bind mounts?
-fn bind_entries(parent: &Path, sandbox: &Path, exclusions: &[&str]) -> Result<()> {
+fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<()> {
     for entry in parent.read_dir()?.collect::<Result<Vec<_>, _>>()? {
         let exclude = exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion));
-        if exclude || sandbox.join(entry.file_name()).exists() {
+        if exclude || target.join(entry.file_name()).exists() {
             continue;
         }
 
@@ -47,7 +47,7 @@ fn bind_entries(parent: &Path, sandbox: &Path, exclusions: &[&str]) -> Result<()
             source = parent.join(fs::read_link(entry.path())?);
         }
 
-        let target = sandbox.join(entry.file_name());
+        let target = target.join(entry.file_name());
         // if source.is_dir() && !target.exists() {
         if !target.exists() {
             if source.is_dir() {
@@ -149,29 +149,29 @@ fn main() -> Result<()> {
     map_user(uid, gid)?;    // restore uid and guid
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)?;
 
-    let sandbox = tempfile::TempDir::new()?.into_path();
-    mount(None::<&str>, &sandbox, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
+    let new_root = tempfile::TempDir::new()?.into_path();
+    mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
 
-    bind_entries(&fhs, &sandbox, &["etc"])?;
-    fs::create_dir(sandbox.join("etc"))?;
+    bind_entries(&fhs, &new_root, &["etc"])?;
+    fs::create_dir(new_root.join("etc"))?;
     // exclude login.defs and pam.d so to not mess with authentication
-    bind_entries(&fhs.join("etc"), &sandbox.join("etc"), &["login.defs", "pam.d"])?;
+    bind_entries(&fhs.join("etc"), &new_root.join("etc"), &["login.defs", "pam.d"])?;
 
     let root = Path::new("/");
-    bind_entries(root, &sandbox, &["etc", "tmp"])?;     // TODO: explain why not mount tmp directly
-    bind_entries(&root.join("etc"), &sandbox.join("etc"), &[])?;
+    bind_entries(root, &new_root, &["etc", "tmp"])?;     // TODO: explain why not mount tmp directly
+    bind_entries(&root.join("etc"), &new_root.join("etc"), &[])?;
 
-    // indirectly join sandbox with tempdir since joining with an absolute path substitutes with it
-    let put_old = sandbox.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
-    fs::create_dir(sandbox.join("tmp"))?;
-    bind_entries(&root.join("tmp"), &sandbox.join("tmp"), &[])?;
+    // indirectly join new_root with tempdir since joining with an absolute path substitutes with it
+    let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
+    fs::create_dir(new_root.join("tmp"))?;
+    bind_entries(&root.join("tmp"), &new_root.join("tmp"), &[])?;
 
     let cwd = std::env::current_dir()?;     // cwd before pivot_root
-    nix::unistd::pivot_root(&sandbox, &put_old)?;
+    nix::unistd::pivot_root(&new_root, &put_old)?;
     std::env::set_current_dir(&cwd)?;       // reset cwd
 
     // discard old root
-    umount2(&root.join(put_old.strip_prefix(sandbox)?), MntFlags::MNT_DETACH)?;
+    umount2(&root.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH)?;
 
     create_ld_so_conf()?;
     prepare_env();
