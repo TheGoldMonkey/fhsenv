@@ -212,9 +212,6 @@ struct Cli {
 
     #[arg(long)]
     run: Option<String>,
-
-    #[arg(long)]
-    command: Option<String>
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -231,9 +228,6 @@ async fn main() -> Result<()> {
     prepare_env_vars();
 
     if let Some(command) = cli.run {
-        let status = Command::new("sh").args(&["-c", &command]).status().await?;
-        std::process::exit(status.code().unwrap_or(1));
-    } else if let Some(command) = cli.command {
         let name = CString::new(command.clone())?;
         nix::unistd::execvp(&name, &[&name]).context(format!("execvp into {command} failed."))?;
     } else {
