@@ -31,7 +31,7 @@ async fn create_ld_so_conf() -> Result<()> {
     ];
 
     fs::write(Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n")).await
-        .context("Couldn't create /etc/ld.so.conf.").map_err(Into::into)
+        .context("Couldn't write to /etc/ld.so.conf.").map_err(Into::into)
 }
 
 fn prepend_entries_in_env(key: &str, additions: &[&str]) {
@@ -177,31 +177,21 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH).map_err(Into::into)
 }
 
-#[derive(clap::Parser)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    shell_nix: Option<PathBuf>,
+fn define_fhs(cli: &Cli) -> Result<String> {
+    if let Some(packages) = &cli.packages {      // TODO: check how nix-shell validates packages input
+        if cli.shell_nix.is_some() {
+            bail!("--packages isn't available when an input file is specified.");
+        }
 
-    #[arg(short, long)]
-    packages: Option<Vec<String>>,
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    let cli: Cli = clap::Parser::parse();
-
-    let fhs_definition;
-    if let Some(packages) = cli.packages {
-        // TODO: check how nix-shell -p validates input
-        fhs_definition = format!("
+        let packages_formatted =
+            packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n");
+        Ok(format!("
             {{ pkgs ? import <nixpkgs> {{}} }}:
             (pkgs.buildFHSUserEnv {{
                 name = \"fhsenv\";
-                targetPkgs = pkgs: (with pkgs; [
-                    {}
-                ]);
+                targetPkgs = pkgs: (with pkgs; [\n{packages_formatted}\n]);
             }}).env
-        ", packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n"));
+        "))
     } else {
         let shell_nix = cli.shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("shell.nix"));
         if !shell_nix.exists() {
@@ -211,19 +201,51 @@ async fn main() -> Result<()> {
         // tokio::fs::read_file_sync is multithreaded and causes unshare to error out
         // > CLONE_NEWUSER requires that the calling process is not threaded
         // from https://man7.org/linux/man-pages/man2/unshare.2.html
-        fhs_definition = std::fs::read_to_string(shell_nix)?;
+        std::fs::read_to_string(shell_nix).map_err(Into::into)
     }
+}
 
+#[derive(clap::Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    shell_nix: Option<PathBuf>,
+
+    #[arg(short, long)]
+    packages: Option<Vec<String>>,
+
+    #[arg(long)]
+    run: Option<String>,
+
+    #[arg(long)]
+    command: Option<String>
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let cli: Cli = clap::Parser::parse();
+    let fhs_definition = define_fhs(&cli)?;
     let fhs = get_fhs(&fhs_definition).await?;
 
     enter_namespace().await.context("Couldn't enter namespace.")?;
     let new_root = create_new_root(&fhs).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context("Couldn't pivot root to {new_root}.")?;
 
-    create_ld_so_conf().await.context("Couldn't create /etc/ld.so.conf")?;
+    create_ld_so_conf().await?;
     prepare_env_vars();
 
-    std::env::set_var("PS1", r"\[\e[1;32m\]\u \W> \[\e[0m\]");      // make command prompt green
-    nix::unistd::execvp(&CString::new("bash")?, &[CString::new("bash")?, CString::new("--norc")?])?;
+    if let Some(command) = cli.run {
+        let status = Command::new("sh").args(&["-c", &command]).status().await?;
+        std::process::exit(status.code().unwrap_or(1));
+    } else if let Some(command) = cli.command {
+        let name = CString::new(command)?;
+        nix::unistd::execvp(&name, &[&name])?;
+    } else {
+        let name = CString::new("bash")?;
+        let ps1 = r"\[\e[1;32m\]\u \W> \[\e[0m\]";      // make the command prompt green
+        let set_ps1 = format!("export PS1=\"{ps1}\"");
+        // https://serverfault.com/questions/368054/
+        let entrypoint = format!("bash --init-file <(echo \"{}\")", set_ps1.replace("\"", "\\\""));
+        nix::unistd::execvp(&name, &[&name, &CString::new("-c")?, &CString::new(entrypoint)?])?;
+    }
     unreachable!();
 }
