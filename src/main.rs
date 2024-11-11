@@ -100,7 +100,12 @@ async fn enter_namespace() -> Result<()> {
     // uid and guid before entering user namespace
     let uid = nix::unistd::Uid::current().as_raw();
     let gid = nix::unistd::Gid::current().as_raw();
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER).context("Couldn't create namespace.")?;
+
+    match unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER) {
+        Err(nix::errno::Errno::EINVAL) if std::fs::read_dir("/proc/self/task")?.count() > 1 =>
+            bail!("Cannot unshare user namespace: process is multithreaded."),
+        result => result.context("Couldn't create namespace.")?
+    }
 
     // restore uid and gid
     fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).await.context("Failed to map uid.")?;
@@ -173,12 +178,13 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH).map_err(Into::into)
 }
 
-fn define_fhs(cli: &Cli) -> Result<String> {
-    if let Some(packages) = &cli.packages {      // TODO: check how nix-shell validates packages input
+async fn define_fhs(cli: &Cli) -> Result<String> {
+    if let Some(packages) = &cli.packages {
         if cli.shell_nix.is_some() {
             bail!("--packages isn't available when an input file is specified.");
         }
 
+        // TODO: check how nix-shell sanitizes/validates packages input
         let packages_formatted =
             packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n");
         Ok(format!("
@@ -194,7 +200,7 @@ fn define_fhs(cli: &Cli) -> Result<String> {
             bail!("{:?} does not exist.", shell_nix.canonicalize()?);
         }
 
-        // tokio::fs::read_file_sync is multithreaded and causes unshare to error out
+        // tokio::fs::read_to_string is multithreaded despite `#[tokio::main(flavor = "current_thread")]`
         // > CLONE_NEWUSER requires that the calling process is not threaded
         // from https://man7.org/linux/man-pages/man2/unshare.2.html
         std::fs::read_to_string(shell_nix)
@@ -217,7 +223,7 @@ struct Cli {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli: Cli = clap::Parser::parse();
-    let fhs_definition = define_fhs(&cli)?;
+    let fhs_definition = define_fhs(&cli).await?;
     let fhs_path = get_fhs_path(&fhs_definition).await?;
 
     enter_namespace().await.context("Couldn't enter namespace.")?;
@@ -231,7 +237,7 @@ async fn main() -> Result<()> {
         let name = CString::new(command.clone())?;
         nix::unistd::execvp(&name, &[&name]).context(format!("execvp into {command} failed."))?;
     } else {
-        let name = CString::new("bash")?;
+        let name = CString::new("bash")?;               // TODO: use the user's default shell rather than bash
         let ps1 = r"\[\e[1;32m\]\u \W> \[\e[0m\]";      // make the command prompt green
         let set_ps1 = format!("export PS1=\"{ps1}\"");
         // https://serverfault.com/questions/368054/
