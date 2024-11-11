@@ -1,28 +1,17 @@
-use std::{ffi::CString, path::Path};
-use anyhow::{anyhow, bail, Result};
+use std::{ffi::CString, path::{Path, PathBuf}};
+use anyhow::{anyhow, bail, Context, Result};
 use nix::sched::{unshare, CloneFlags};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use tokio::fs;
+use tokio::{fs, process::Command};
 
-async fn subprocess(program: &str, args: &[&str], check: bool) -> Result<String> {
-    let mut command = tokio::process::Command::new(program);
-    for arg in args {
-        command.arg(arg);
-    }
+async fn subprocess(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program).args(args).output().await?;
 
-    let output = command.output().await?;
-    if check && !output.status.success() {
+    if !output.status.success() {
         bail!("Error running {program} {}: {}.", args.join(" "), String::from_utf8(output.stderr.clone())?);
     }
 
-    String::from_utf8(output.stdout).map_err(Into::into)
-}
-
-async fn get_shell_hook(derivation_path: &str) -> Result<String> {
-    let output = subprocess("nix", &["derivation", "show", &derivation_path], true).await?;
-    let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
-    let shell_hook = &derivation[&derivation_path]["env"]["shellHook"];
-    shell_hook.as_str().map(str::to_owned).ok_or(anyhow!("Unable to parse derivation for shellHook."))
+    String::from_utf8(output.stdout.trim_ascii().to_vec()).map_err(Into::into)
 }
 
 async fn create_ld_so_conf() -> Result<()> {
@@ -41,7 +30,8 @@ async fn create_ld_so_conf() -> Result<()> {
         "/run/opengl-driver-32/lib"
     ];
 
-    fs::write(Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n")).await.map_err(Into::into)
+    fs::write(Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n")).await
+        .context("Couldn't create /etc/ld.so.conf.").map_err(Into::into)
 }
 
 fn prepend_entries_in_env(key: &str, additions: &[&str]) {
@@ -76,18 +66,32 @@ fn prepare_env_vars() {
     std::env::set_var("LOCALE_ARCHIVE", "/usr/lib/locale/locale-archive");
 }
 
-async fn get_fhs(shell_nix: &str) -> Result<std::path::PathBuf> {
-    let derivation_path = subprocess("nix-instantiate", &[shell_nix], true).await?;
-    let shell_hook = get_shell_hook(derivation_path.trim()).await?;
+async fn get_fhs(fhs_definition: &str) -> Result<PathBuf> {
+    let derivation_path = subprocess("nix-instantiate", &["-E", &fhs_definition]).await?;
+    let output = subprocess("nix", &["derivation", "show", &derivation_path]).await?;
+    let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
 
-    let pattern = regex::Regex::new(r"/nix/store/([^-]+)-(.+)-shell-env.drv")?;
-    let fhsenv_name = &pattern.captures(&derivation_path)
-        .ok_or(anyhow!("Unable to parse derivation path for FHS environment name."))?[2];
+    let pattern = regex::Regex::new(r"^(.*)-shell-env$")?;
+    let fhsenv_name = &pattern.captures(derivation[&derivation_path]["name"].as_str().unwrap_or_default())
+        .ok_or(anyhow!("Couldn't parse derivation for environment name."))?[1];
 
-    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs", regex::escape(fhsenv_name)))?;
-    let _match = pattern.find(&shell_hook).ok_or(anyhow!("Expected {pattern} to match shellHook."))?;
+    let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
+        bail!("Couldn't parse derivation for FHS store path.");
+    };
+    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
+    let _match = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
+        .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?;
+    let fhs_drv = Path::new(_match.as_str());
 
-    Ok(Path::new(_match.as_str()).into())
+    // like subprocess but without piping stderr
+    let process = Command::new("nix-build").arg(fhs_drv).stdout(std::process::Stdio::piped()).spawn()?;
+    let output = process.wait_with_output().await?;
+    let fhs = Path::new(std::str::from_utf8(&output.stdout)?.trim());
+    if !output.status.success() || !fhs.exists() {
+        bail!("Error building {fhs_drv:?}.");
+    }
+
+    Ok(fhs.into())
 }
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
@@ -96,14 +100,15 @@ async fn enter_namespace() -> Result<()> {
     // uid and guid before entering user namespace
     let uid = nix::unistd::Uid::current().as_raw();
     let gid = nix::unistd::Gid::current().as_raw();
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER)?;  // TODO: handle this error
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER).context("Couldn't create namespace.")?;
 
     // restore uid and gid
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).await?;
-    fs::write("/proc/self/setgroups", "deny").await?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).await?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).await.context("Couldn't map uid.")?;
+    fs::write("/proc/self/setgroups", "deny").await.context("Couldn't disable setgroups")?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).await.context("Couldn't map gid")?;
 
-    mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)?;
+    mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
+        .context("Couldn't set recursive slave mount at root.")?;
 
     Ok(())
 }
@@ -143,7 +148,7 @@ lazy_static::lazy_static! {
     static ref ROOT: &'static Path = Path::new("/");
 }
 
-async fn create_new_root(fhs: &Path) -> Result<std::path::PathBuf> {
+async fn create_new_root(fhs: &Path) -> Result<PathBuf> {
     let new_root = tempfile::TempDir::new()?.into_path();
     mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
 
@@ -172,21 +177,50 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH).map_err(Into::into)
 }
 
+#[derive(clap::Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    shell_nix: Option<PathBuf>,
+
+    #[arg(short, long)]
+    packages: Option<Vec<String>>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let shell_nix = std::env::args().nth(1).ok_or(anyhow!("shell.nix path missing."))?;
+    let cli: Cli = clap::Parser::parse();
 
-    // asynchronously build the fhs store path
-    let handle = tokio::spawn(glib::clone!(#[to_owned] shell_nix,
-        async move { subprocess("nix-build", &[&shell_nix], false).await }));
+    let fhs_definition;
+    if let Some(packages) = cli.packages {
+        // TODO: check how nix-shell -p validates input
+        fhs_definition = format!("
+            {{ pkgs ? import <nixpkgs> {{}} }}:
+            (pkgs.buildFHSUserEnv {{
+                name = \"fhsenv\";
+                targetPkgs = pkgs: (with pkgs; [
+                    {}
+                ]);
+            }}).env
+        ", packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n"));
+    } else {
+        let shell_nix = cli.shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("shell.nix"));
+        if !shell_nix.exists() {
+            bail!("{:?} does not exist.", shell_nix.canonicalize()?);
+        }
 
-    let fhs = get_fhs(&shell_nix).await?;
-    enter_namespace().await?;
-    handle.await??;     // create_new_root needs the fhs store path built
-    let new_root = create_new_root(&fhs).await?;
-    pivot_root(&new_root).await?;
+        // tokio::fs::read_file_sync is multithreaded and causes unshare to error out
+        // > CLONE_NEWUSER requires that the calling process is not threaded
+        // from https://man7.org/linux/man-pages/man2/unshare.2.html
+        fhs_definition = std::fs::read_to_string(shell_nix)?;
+    }
 
-    create_ld_so_conf().await?;
+    let fhs = get_fhs(&fhs_definition).await?;
+
+    enter_namespace().await.context("Couldn't enter namespace.")?;
+    let new_root = create_new_root(&fhs).await.context("Couldn't create new_root")?;
+    pivot_root(&new_root).await.context("Couldn't pivot root to {new_root}.")?;
+
+    create_ld_so_conf().await.context("Couldn't create /etc/ld.so.conf")?;
     prepare_env_vars();
 
     std::env::set_var("PS1", r"\[\e[1;32m\]\u \W> \[\e[0m\]");      // make command prompt green
