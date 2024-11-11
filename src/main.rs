@@ -66,7 +66,7 @@ fn prepare_env_vars() {
     std::env::set_var("LOCALE_ARCHIVE", "/usr/lib/locale/locale-archive");
 }
 
-async fn get_fhs(fhs_definition: &str) -> Result<PathBuf> {
+async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     let derivation_path = subprocess("nix-instantiate", &["-E", &fhs_definition]).await?;
     let output = subprocess("nix", &["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
@@ -103,9 +103,9 @@ async fn enter_namespace() -> Result<()> {
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER).context("Couldn't create namespace.")?;
 
     // restore uid and gid
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).await.context("Couldn't map uid.")?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).await.context("Failed to map uid.")?;
     fs::write("/proc/self/setgroups", "deny").await.context("Couldn't disable setgroups")?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).await.context("Couldn't map gid")?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).await.context("Failed to map gid")?;
 
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
         .context("Couldn't set recursive slave mount at root.")?;
@@ -122,23 +122,19 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
             continue;
         }
 
-        let mut source = entry.path();
-        if fs::symlink_metadata(entry.path()).await?.file_type().is_symlink() {
-            source = parent.join(fs::read_link(entry.path()).await?);
-        }
-
         let target = target.join(entry.file_name());
         // if source.is_dir() && !target.exists() {
         if !target.exists() {
-            if source.is_dir() {
-                fs::create_dir(&target).await?;
+            if entry.path().is_dir() {
+                fs::create_dir(&target).await.context("Failed to create stub directory.")?;
             } else {
-                fs::write(&target, "").await?;
+                fs::write(&target, "").await.context("Failed to create stub file.")?;
             }
         }
 
         let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
-        mount(Some(&source), &target, None::<&str>, flags, None::<&str>)?;  // mount works with files too
+        mount(Some(&entry.path()), &target, None::<&str>, flags, None::<&str>)  // mount works with files too
+            .context(format!("Failed to mount {entry:?} to {target:?}"))?;
     }
 
     Ok(())
@@ -148,14 +144,14 @@ lazy_static::lazy_static! {
     static ref ROOT: &'static Path = Path::new("/");
 }
 
-async fn create_new_root(fhs: &Path) -> Result<PathBuf> {
+async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     let new_root = tempfile::TempDir::new()?.into_path();
     mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
 
-    bind_entries(fhs, &new_root, &["etc"]).await?;
-    fs::create_dir(new_root.join("etc")).await?;
+    bind_entries(fhs_path, &new_root, &["etc"]).await?;
+    fs::create_dir(new_root.join("etc")).await.context("Failed to create etc in new_root")?;
     // exclude login.defs and pam.d so to not mess with authentication
-    bind_entries(&fhs.join("etc"), &new_root.join("etc"), &["login.defs", "pam.d"]).await?;
+    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &["login.defs", "pam.d"]).await?;
 
     // let root = Path::new("/");
     bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;     // TODO: explain why not mount tmp directly
@@ -166,7 +162,7 @@ async fn create_new_root(fhs: &Path) -> Result<PathBuf> {
 
 async fn pivot_root(new_root: &Path) -> Result<()> {
     let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
-    fs::create_dir(new_root.join("tmp")).await?;
+    fs::create_dir(new_root.join("tmp")).await.context("Failed to create tmp in new root")?;
     bind_entries(&ROOT.join("tmp"), &new_root.join("tmp"), &[]).await?;
 
     let cwd = std::env::current_dir()?;     // cwd before pivot_root
@@ -201,7 +197,8 @@ fn define_fhs(cli: &Cli) -> Result<String> {
         // tokio::fs::read_file_sync is multithreaded and causes unshare to error out
         // > CLONE_NEWUSER requires that the calling process is not threaded
         // from https://man7.org/linux/man-pages/man2/unshare.2.html
-        std::fs::read_to_string(shell_nix).map_err(Into::into)
+        std::fs::read_to_string(shell_nix)
+            .context(format!("Failed to read from {shell_nix:?}.")).map_err(Into::into)
     }
 }
 
@@ -224,11 +221,11 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli: Cli = clap::Parser::parse();
     let fhs_definition = define_fhs(&cli)?;
-    let fhs = get_fhs(&fhs_definition).await?;
+    let fhs_path = get_fhs_path(&fhs_definition).await?;
 
     enter_namespace().await.context("Couldn't enter namespace.")?;
-    let new_root = create_new_root(&fhs).await.context("Couldn't create new_root")?;
-    pivot_root(&new_root).await.context("Couldn't pivot root to {new_root}.")?;
+    let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
+    pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
     create_ld_so_conf().await?;
     prepare_env_vars();
@@ -237,15 +234,16 @@ async fn main() -> Result<()> {
         let status = Command::new("sh").args(&["-c", &command]).status().await?;
         std::process::exit(status.code().unwrap_or(1));
     } else if let Some(command) = cli.command {
-        let name = CString::new(command)?;
-        nix::unistd::execvp(&name, &[&name])?;
+        let name = CString::new(command.clone())?;
+        nix::unistd::execvp(&name, &[&name]).context(format!("execvp into {command} failed."))?;
     } else {
         let name = CString::new("bash")?;
         let ps1 = r"\[\e[1;32m\]\u \W> \[\e[0m\]";      // make the command prompt green
         let set_ps1 = format!("export PS1=\"{ps1}\"");
         // https://serverfault.com/questions/368054/
         let entrypoint = format!("bash --init-file <(echo \"{}\")", set_ps1.replace("\"", "\\\""));
-        nix::unistd::execvp(&name, &[&name, &CString::new("-c")?, &CString::new(entrypoint)?])?;
+        nix::unistd::execvp(&name, &[&name, &CString::new("-c")?, &CString::new(entrypoint)?])
+            .context("execvp into bash failed.")?;
     }
     unreachable!();
 }
