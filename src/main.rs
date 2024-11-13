@@ -1,4 +1,4 @@
-use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}};
+use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}, process::Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{unshare, setns, CloneFlags}, sys::signal, unistd::{execvp, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -79,16 +79,15 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
         bail!("Couldn't parse derivation for FHS store path.");
     };
     let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
-    let _match = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
-        .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?;
-    let fhs_drv = Path::new(_match.as_str());
+    let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
+        .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
     // like subprocess but without piping stderr
-    let process = Command::new("nix-build").arg(fhs_drv).stdout(std::process::Stdio::piped()).spawn()?;
+    let process = Command::new("nix-store").args(["--realise", fhs_drv]).stdout(Stdio::piped()).spawn()?;
     let output = process.wait_with_output().await?;
     let fhs = Path::new(std::str::from_utf8(&output.stdout)?.trim());
     if !output.status.success() || !fhs.exists() {
-        bail!("Error building {fhs_drv:?}.");
+        bail!("Error building {fhs_drv}.");
     }
 
     Ok(fhs.into())
@@ -97,6 +96,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
 #[derive(Clone, Copy)]
 enum Mapping { Uid, Gid }
 
+// TODO: there can be multiple ranges for a single user
 async fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
     let subuid = std::fs::read_to_string(path).context("Failed to read /etc/subuid.")?;
@@ -144,9 +144,9 @@ async fn enter_namespace() -> Result<()> {
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
-    set_mapping(Mapping::Uid, pid, uid, &username).await.context("Failed to map uid")?;
+    set_mapping(Mapping::Uid, pid, uid, &username).await.context("Failed to map uid.")?;
     std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups")?;
-    set_mapping(Mapping::Gid, pid, gid, &username).await?;
+    set_mapping(Mapping::Gid, pid, gid, &username).await.context("Failed to map gid.")?;
 
     // Enter the namespace
     let ns_path = format!("/proc/{pid}/ns/user");
@@ -203,8 +203,7 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
 
     bind_entries(fhs_path, &new_root, &["etc"]).await?;
     fs::create_dir(new_root.join("etc")).await.context("Failed to create etc in new_root")?;
-    // exclude login.defs and pam.d so to not mess with authentication
-    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &["login.defs", "pam.d"]).await?;
+    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
 
     bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;     // TODO: explain why not mount tmp directly
     bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &[]).await?;
