@@ -17,8 +17,8 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
 }
 
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
-    let derivation_path = subprocess("nix-instantiate", &["-E", &fhs_definition]).await?;
-    let output = subprocess("nix", &["derivation", "show", &derivation_path]).await?;
+    let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
+    let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
 
     let pattern = regex::Regex::new(r"^(.*)-shell-env$")?;
@@ -49,16 +49,16 @@ enum Mapping { Uid, Gid }
 // TODO: there can be multiple ranges for a single user
 async fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
-    let subuid = std::fs::read_to_string(path).context("Failed to read /etc/subuid.")?;
-    for line in subuid.split('\n') {
+    let subuid = std::fs::read_to_string(path).context(format!("Failed to read {path}."))?;
+    for (i, line) in subuid.split('\n').enumerate() {
         let [_username, lower_id, range] = line.split(':').collect::<Vec<_>>()[..] else {
             continue;
         };
 
         if _username == username {
             return Ok((
-                lower_id.parse().context("User has invalid lower_id in /etc/subuid.")?,
-                range.parse().context("User has invalid range in /etc/subuid.")?
+                lower_id.parse().context(format!("{path} line {i}: invalid lower_id."))?,
+                range.parse().context(format!("{path} line {i}: invalid range."))?,
             ));
         }
     }
@@ -89,16 +89,17 @@ async fn enter_namespace() -> Result<()> {
         .unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
     let gid = nix::unistd::Gid::current().as_raw();
 
-    // TODO: explain why spawn separate process to create namespace
+    // newuidmap and newgidmap don't work on own user namespace
+    // so create it in a separate process and enter it later
     let mut process = Command::new("unshare").args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
     set_mapping(Mapping::Uid, pid, uid, &username).await.context("Failed to map uid.")?;
-    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups")?;
+    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups.")?;
     set_mapping(Mapping::Gid, pid, gid, &username).await.context("Failed to map gid.")?;
 
-    // Enter the namespace
+    // enter the namespace
     let ns_path = format!("/proc/{pid}/ns/user");
     let ns_fd = std::fs::File::open(&ns_path).context(format!("Failed to open {ns_path}."))?;
     setns(ns_fd, CloneFlags::CLONE_NEWUSER).context(format!("Couldn't enter {ns_path}."))?;
@@ -137,15 +138,13 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
 
         let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
         mount(Some(&entry.path()), &target, None::<&str>, flags, None::<&str>)  // mount works with files too
-            .context(format!("Failed to mount {entry:?} to {target:?}."))?;
+            .context(format!("Failed to bind {entry:?} to {target:?}."))?;
     }
 
     Ok(())
 }
 
-lazy_static::lazy_static! {
-    static ref ROOT: &'static Path = Path::new("/");
-}
+lazy_static::lazy_static! { static ref ROOT: &'static Path = Path::new("/"); }
 
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     let new_root = tempfile::TempDir::new()?.into_path();
@@ -166,12 +165,17 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
     fs::create_dir(new_root.join("tmp")).await.context("Failed to create tmp in new root")?;
     bind_entries(&ROOT.join("tmp"), &new_root.join("tmp"), &[]).await?;
 
-    let cwd = std::env::current_dir()?;     // cwd before pivot_root
+    let cwd = std::env::current_dir();          // cwd before pivot_root
     nix::unistd::pivot_root(new_root, &put_old)?;
-    std::env::set_current_dir(&cwd)?;       // reset cwd
+    if let Ok(cwd) = cwd {
+        if let Err(error) = std::env::set_current_dir(&cwd) {       // reset cwd
+            eprintln!("Unable to change back to {cwd:?}: {error}.");
+        }
+    }
 
     // discard old root
-    umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH).map_err(Into::into)
+    umount2(&ROOT.join(put_old.strip_prefix(new_root)?), MntFlags::MNT_DETACH)
+        .context("Unable to unmount old root.").map_err(Into::into)
 }
 
 async fn define_fhs(cli: &Cli) -> Result<String> {
@@ -213,8 +217,8 @@ fn enter_shell(cli: Cli) -> Result<()> {
         // https://serverfault.com/questions/368054/
         format!("bash --init-file <(echo \"{}\")", set_ps1.replace("\"", "\\\""))
     });
-    execvp(&name, &[&name, &CString::new("-c")?, &CString::new(entrypoint)?])
-        .context("execvp into bash failed.")?;
+    let args = [&name, &CString::new("-c")?, &CString::new(entrypoint)?];
+    execvp(&name, &args).context("execvp into bash failed.")?;
 
     unreachable!();
 }
