@@ -1,4 +1,4 @@
-use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}, process::Stdio};
+use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -23,7 +23,6 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
 
 // TODO: handle the case where fhs_derivation doesn't actually define an FHS environment
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
-    // TODO: hardcode paths
     let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
     let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
@@ -42,11 +41,8 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     // like subprocess but without piping stderr
     let output = Command::new(BIN.join("nix-store"))
         .args(["--realise", fhs_drv])
-        .stdout(Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?;
-    // let output = process;
+        .stdout(std::process::Stdio::piped())
+        .spawn()?.wait_with_output().await?;
     let fhs_path = Path::new(std::str::from_utf8(&output.stdout)?.trim());
     if !output.status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
@@ -93,7 +89,6 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
 // https://man7.org/linux/man-pages/man1/newuidmap.1.html
-// TODO: hardcode paths
 async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
     let username =
         User::from_uid(uid).unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
@@ -123,37 +118,44 @@ async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
 }
 
 // TODO: is there a practical limit on number of bind mounts?
-async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<()> {
-    // TODO: loop asynchronously
-    for entry in parent.read_dir()?.collect::<Result<Vec<_>, _>>()? {
-        let exclude = exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion));
-        if exclude || target.join(entry.file_name()).exists() {
-            continue;
-        }
-
-        let target = target.join(entry.file_name());
-        if !target.exists() {
-            if entry.path().is_dir() {
-                fs::create_dir(&target).await.context("Failed to create stub directory.")?;
-            } else {
-                fs::write(&target, "").await.context("Failed to create stub file.")?;
-            }
-        }
-
-        // TODO: also consider nosuid, nodev, etc.
-        let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
-        mount(Some(&entry.path()), &target, None::<&str>, flags, None::<&str>)  // mount works with files too
-            .context(format!("Failed to bind {entry:?} to {target:?}."))?;
+async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
+    let exists = tokio::fs::try_exists(target).await
+        .context(format!("Failed to determine {target:?}'s existence."))?;
+    if exists {
+        return Ok(());
     }
 
-    Ok(())
+    let metadata = tokio::fs::metadata(entry).await
+        .context(format!("Failed to query {entry:?}'s metadata."))?;
+    if metadata.is_dir() {
+        fs::create_dir(&target).await.context("Failed to create stub directory.")?;
+    } else {
+        fs::write(&target, "").await.context("Failed to create stub file.")?;
+    }
+
+    let flags = MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    mount(Some(entry), target, None::<&str>, flags, None::<&str>)  // mount works with files too
+        .context(format!("Failed to bind {entry:?} to {target:?}."))
+}
+
+// asynchronously loop over bind_entry
+async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<Vec<()>> {
+    futures::future::join_all(parent.read_dir()?.map(|result| async move {
+        let entry = result?;
+        if exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
+            Ok(())
+        } else {
+            bind_entry(&entry.path(), &target.join(entry.file_name())).await
+        }
+    })).await.into_iter().collect()
 }
 
 // TODO: if there are programs in /usr/bin which are in /run/wrappers/bin
 // then bind the latter onto the former
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     // TODO: validate entries in fhs_path
-    dbg!(fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()?);
+    // as sbin, lib64, etc, lib, bin, usr
+    // dbg!(fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()?);
 
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
         .context("Failed to make root a slave mount.")?;
@@ -166,17 +168,16 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     // TODO: document the privilege escalation concern here
     // https://unix.stackexchange.com/questions/65039/
     fs::create_dir(new_root.join("etc")).await.context("Failed to create etc in new_root")?;
+    prepare_env::create_ld_so_conf(&new_root)?;
     bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
-    let to_protect = ["gshadow", "login.defs", "pam.d", "passwd", "shadow", "ssh", "sudoers"];     // hopefully redundant
-    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &to_protect).await?;
+    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
 
     bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;     // TODO: explain why not mount tmp directly
-
-    prepare_env::create_ld_so_conf()?;
 
     Ok(new_root)
 }
 
+// TODO: why does mktemp fail after pivot_root?
 async fn pivot_root(new_root: &Path) -> Result<()> {
     let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
     fs::create_dir(new_root.join("tmp")).await.context("Failed to create tmp in new root")?;
@@ -195,12 +196,16 @@ async fn pivot_root(new_root: &Path) -> Result<()> {
         .context("Unable to unmount old root.").map_err(Into::into)
 }
 
-async fn define_fhs(cli: &Cli) -> Result<String> {
-    if let Some(packages) = &cli.packages {
-        if cli.shell_nix.is_some() {
-            bail!("--packages isn't available when the input is provided.");
+fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
+    if packages.is_empty() {
+        let shell_nix = shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("./shell.nix"));
+        if !shell_nix.exists() {
+            bail!("{:?} does not exist.", shell_nix.canonicalize()?);
         }
 
+        std::fs::read_to_string(shell_nix)
+            .context(format!("Failed to read from {shell_nix:?}.")).map_err(Into::into)
+    } else {
         // TODO: check how nix-shell sanitizes/validates packages input
         let packages_formatted =
             packages.into_iter().map(|package| format!("({package})")).collect::<Vec<_>>().join("\n");
@@ -211,23 +216,12 @@ async fn define_fhs(cli: &Cli) -> Result<String> {
                 targetPkgs = pkgs: (with pkgs; [\n{packages_formatted}\n]);
             }}).env
         "))
-    } else {
-        let shell_nix = cli.shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("./shell.nix"));
-        if !shell_nix.exists() {
-            bail!("{:?} does not exist.", shell_nix.canonicalize()?);
-        }
-
-        // tokio::fs::read_to_string is multithreaded despite `#[tokio::main(flavor = "current_thread")]`
-        // > CLONE_NEWUSER requires that the calling process is not threaded
-        // from https://man7.org/linux/man-pages/man2/unshare.2.html
-        std::fs::read_to_string(shell_nix)
-            .context(format!("Failed to read from {shell_nix:?}.")).map_err(Into::into)
     }
 }
 
-fn enter_shell(cli: Cli) -> Result<()> {
+fn enter_shell(entrypoint: Option<String>) -> Result<()> {
     let name = CString::new("bash")?;               // TODO: use the default shell rather than bash
-    let entrypoint = cli.run.unwrap_or_else(|| {
+    let entrypoint = entrypoint.unwrap_or_else(|| {
         // make the command prompt green
         let ps1 = r"\[\e[1;32m\]\u \W> \[\e[0m\]";
         let set_ps1 = format!("export PS1=\"{ps1}\"");
@@ -243,13 +237,20 @@ fn enter_shell(cli: Cli) -> Result<()> {
 #[derive(clap::Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    shell_nix: Option<PathBuf>,
-
-    #[arg(short, long)]
-    packages: Option<Vec<String>>,
+    #[command(flatten)]
+    mode: Mode,
 
     #[arg(long)]
-    run: Option<String>
+    run: Option<String>,
+}
+
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct Mode {
+    shell_nix: Option<PathBuf>,
+
+    #[clap(short, long, num_args = 1..)]
+    packages: Vec<String>
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -261,12 +262,12 @@ async fn main() -> Result<()> {
     setegid(gid)?;
 
     let cli: Cli = clap::Parser::parse();
-    let fhs_definition = define_fhs(&cli).await?;
+    let fhs_definition = define_fhs(cli.mode)?;
     let fhs_path = get_fhs_path(&fhs_definition).await?;
 
     if rootless {
         // this carries all the drawbacks of the bubblewrap implementation
-        // only really implemented as learning exercise
+        // only really implemented as learning exercise, unreachable when compiled with suid
         enter_user_namespace(uid, gid).await.context("Couldn't enter user namespace.")?;
     } else {
         // elevate to root
@@ -283,5 +284,5 @@ async fn main() -> Result<()> {
     setegid(gid)?;
 
     prepare_env::prepare_env();
-    enter_shell(cli)
+    enter_shell(cli.run)
 }

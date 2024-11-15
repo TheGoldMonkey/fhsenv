@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-pub fn create_ld_so_conf() -> Result<()> {
+pub fn create_ld_so_conf(new_root: &std::path::Path) -> Result<()> {
     let ld_so_conf_entries = [
         "/lib",
         "/lib/x86_64-linux-gnu",
@@ -16,7 +16,7 @@ pub fn create_ld_so_conf() -> Result<()> {
         "/run/opengl-driver-32/lib"
     ];
 
-    std::fs::write(std::path::Path::new("/etc/ld.so.conf"), ld_so_conf_entries.join("\n"))
+    std::fs::write(new_root.join("etc/ld.so.conf"), ld_so_conf_entries.join("\n"))
         .context("Couldn't write to /etc/ld.so.conf.").map_err(Into::into)
 }
 
