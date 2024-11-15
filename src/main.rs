@@ -43,9 +43,22 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
         .args(["--realise", fhs_drv])
         .stdout(std::process::Stdio::piped())
         .spawn()?.wait_with_output().await?;
-    let fhs_path = Path::new(std::str::from_utf8(&output.stdout)?.trim());
-    if !output.status.success() || !fhs_path.exists() {
+    let (output, status) = (std::str::from_utf8(&output.stdout)?.trim(), output.status);
+    let fhs_path = Path::new(output);
+    if !status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
+    }
+    let pattern = regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhs$", regex::escape(fhsenv_name)))?;
+    if pattern.find(&output).is_none() {
+        bail!("Invalid output from nix-store --realise {fhs_drv}: {output}.");
+    }
+
+    // toctou is mitigated by nix store being a read only filesystem
+    let entries_expected = ["bin", "etc", "lib", "lib64", "sbin", "usr"];
+    for entry in fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()? {
+        if !entries_expected.iter().any(|expected| Some(expected) == entry.file_name().to_str().as_ref()) {
+            bail!("Unexpected subdirectory in {fhs_path:?}: {entry:?}.");
+        }
     }
 
     Ok(fhs_path.into())
@@ -153,10 +166,6 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
 // TODO: if there are programs in /usr/bin which are in /run/wrappers/bin
 // then bind the latter onto the former
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
-    // TODO: validate entries in fhs_path
-    // as sbin, lib64, etc, lib, bin, usr
-    // dbg!(fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()?);
-
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
         .context("Failed to make root a slave mount.")?;
 
