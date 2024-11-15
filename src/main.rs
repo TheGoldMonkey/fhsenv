@@ -6,8 +6,13 @@ use tokio::{fs, process::Command};
 
 mod prepare_env;
 
+lazy_static::lazy_static! {
+    static ref ROOT: &'static Path = Path::new("/");
+    static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");    // mitigates malicious $PATH
+}
+
 async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I) -> Result<String> {
-    let output = Command::new(program).args(args).output().await?;
+    let output = Command::new(BIN.join(program)).args(args).output().await?;
 
     if !output.status.success() {
         bail!("Error running {program}: {}.", String::from_utf8(output.stderr.clone())?);
@@ -35,8 +40,13 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
     // like subprocess but without piping stderr
-    let process = Command::new("nix-store").args(["--realise", fhs_drv]).stdout(Stdio::piped()).spawn()?;
-    let output = process.wait_with_output().await?;
+    let output = Command::new(BIN.join("nix-store"))
+        .args(["--realise", fhs_drv])
+        .stdout(Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?;
+    // let output = process;
     let fhs_path = Path::new(std::str::from_utf8(&output.stdout)?.trim());
     if !output.status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
@@ -49,7 +59,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
 enum Mapping { Uid, Gid }
 
 // TODO: there can be multiple ranges for a single user
-async fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
+fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
     let subuid = std::fs::read_to_string(path).context(format!("Failed to read {path}."))?;
     for (i, line) in subuid.split('\n').enumerate() {
@@ -69,7 +79,7 @@ async fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
 }
 
 async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Result<String> {
-    let (lower_id, range) = read_subuid(mapping, &username).await?;
+    let (lower_id, range) = read_subuid(mapping, &username)?;
     let args = [
         pid,
         0, lower_id, uid,
@@ -81,7 +91,6 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
     subprocess(mapper, args.iter().map(u32::to_string).into_iter()).await
 }
 
-// entering a user namespace carries all the drawbacks of the bubblewrap implementation
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
 // https://man7.org/linux/man-pages/man1/newuidmap.1.html
 // TODO: hardcode paths
@@ -91,7 +100,7 @@ async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
 
     // newuidmap and newgidmap don't work on its own user namespace
     // so create it in separate process and then enter it
-    let mut process = Command::new("unshare").args(&["-U", "sleep", "infinity"]).spawn()
+    let mut process = Command::new(BIN.join("unshare")).args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
@@ -139,8 +148,6 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
 
     Ok(())
 }
-
-lazy_static::lazy_static! { static ref ROOT: &'static Path = Path::new("/"); }
 
 // TODO: if there are programs in /usr/bin which are in /run/wrappers/bin
 // then bind the latter onto the former
@@ -258,6 +265,8 @@ async fn main() -> Result<()> {
     let fhs_path = get_fhs_path(&fhs_definition).await?;
 
     if rootless {
+        // this carries all the drawbacks of the bubblewrap implementation
+        // only really implemented as learning exercise
         enter_user_namespace(uid, gid).await.context("Couldn't enter user namespace.")?;
     } else {
         // elevate to root
