@@ -1,8 +1,8 @@
-use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}};
+use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use tokio::{fs, process::Command};
+use tokio::process::Command;
 
 mod prepare_env;
 
@@ -15,13 +15,13 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
     let output = Command::new(BIN.join(program)).args(args).output().await?;
 
     if !output.status.success() {
-        bail!("Error running {program}: {}.", String::from_utf8(output.stderr.clone())?);
+        bail!("Error running {program}: {}.", String::from_utf8(output.stderr)?);
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
-// TODO: handle the case where fhs_derivation doesn't actually define an FHS environment
+// TODO: handle the case where fhs_derivation doesn't actually evaluate to buildFHSUserEnv.env
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
     let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
@@ -141,9 +141,9 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
     let metadata = tokio::fs::metadata(entry).await
         .context(format!("Failed to query {entry:?}'s metadata."))?;
     if metadata.is_dir() {
-        fs::create_dir(&target).await.context("Failed to create stub directory.")?;
+        tokio::fs::create_dir(&target).await.context("Failed to create stub directory.")?;
     } else {
-        fs::write(&target, "").await.context("Failed to create stub file.")?;
+        tokio::fs::write(&target, "").await.context("Failed to create stub file.")?;
     }
 
     let flags = MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
@@ -163,8 +163,11 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
     })).await.into_iter().collect()
 }
 
-// TODO: if there are programs in /usr/bin which are in /run/wrappers/bin
-// then bind the latter onto the former
+// mount requires root since it allows the caller to change passwords
+// > mount a filesystem of your choice on /etc, with an /etc/shadow containing a root password that you know
+// https://unix.stackexchange.com/questions/65039/
+// this is mitigated by giving entries in /etc precedence over those in fhs_path
+// btw normal packages use /run/current-system/sw/etc and /etc only contains system configuration
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
         .context("Failed to make root a slave mount.")?;
@@ -174,14 +177,14 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
 
     bind_entries(fhs_path, &new_root, &["etc"]).await?;
 
-    // TODO: document the privilege escalation concern here
-    // https://unix.stackexchange.com/questions/65039/
-    fs::create_dir(new_root.join("etc")).await.context("Failed to create etc in new_root")?;
+    fs::create_dir(new_root.join("etc")).context("Failed to create etc in new_root")?;
     prepare_env::create_ld_so_conf(&new_root)?;
     bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
     bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
 
-    bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;     // TODO: explain why not mount tmp directly
+    // /tmp isn't mounted to new_root/tmp because new_root is inside /tmp causing pivot_root later to fail
+    // instead we later just mount /tmp's contents
+    bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;
 
     Ok(new_root)
 }
@@ -189,7 +192,9 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
 // TODO: why does mktemp fail after pivot_root?
 async fn pivot_root(new_root: &Path) -> Result<()> {
     let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
-    fs::create_dir(new_root.join("tmp")).await.context("Failed to create tmp in new root")?;
+    fs::create_dir(new_root.join("tmp")).context("Failed to create tmp in new root")?;
+    std::fs::set_permissions(new_root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .context("Failed to set permissions on tmp")?;
     bind_entries(&ROOT.join("tmp"), &new_root.join("tmp"), &[]).await?;
 
     let cwd = std::env::current_dir();          // cwd before pivot_root
@@ -281,7 +286,7 @@ async fn main() -> Result<()> {
     } else {
         // elevate to root
         seteuid(0.into())?;
-        setegid(0.into())?;    
+        setegid(0.into())?;
     }
     // https://unix.stackexchange.com/questions/476847/
     unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create namespace.")?;
