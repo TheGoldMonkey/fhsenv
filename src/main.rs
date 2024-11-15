@@ -1,6 +1,6 @@
 use std::{ffi::{CString, OsStr}, path::{Path, PathBuf}, process::Stdio};
 use anyhow::{anyhow, bail, Context, Result};
-use nix::{sched::{unshare, setns, CloneFlags}, sys::signal, unistd::{execvp, Uid, User}};
+use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use tokio::{fs, process::Command};
 
@@ -16,7 +16,9 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
     Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
+// TODO: handle the case where fhs_derivation doesn't actually define an FHS environment
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
+    // TODO: hardcode paths
     let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
     let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
@@ -35,12 +37,12 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     // like subprocess but without piping stderr
     let process = Command::new("nix-store").args(["--realise", fhs_drv]).stdout(Stdio::piped()).spawn()?;
     let output = process.wait_with_output().await?;
-    let fhs = Path::new(std::str::from_utf8(&output.stdout)?.trim());
-    if !output.status.success() || !fhs.exists() {
+    let fhs_path = Path::new(std::str::from_utf8(&output.stdout)?.trim());
+    if !output.status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
     }
 
-    Ok(fhs.into())
+    Ok(fhs_path.into())
 }
 
 #[derive(Clone, Copy)]
@@ -79,25 +81,23 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
     subprocess(mapper, args.iter().map(u32::to_string).into_iter()).await
 }
 
+// entering a user namespace carries all the drawbacks of the bubblewrap implementation
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
 // https://man7.org/linux/man-pages/man1/newuidmap.1.html
-async fn enter_namespace() -> Result<()> {
-    // TODO: does it matter whether user is root?
-    // uid and guid before entering user namespace
-    let uid = Uid::current().as_raw();
-    let username = User::from_uid(Uid::current())
-        .unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
-    let gid = nix::unistd::Gid::current().as_raw();
+// TODO: hardcode paths
+async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
+    let username =
+        User::from_uid(uid).unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
 
-    // newuidmap and newgidmap don't work on own user namespace
-    // so create it in a separate process and enter it later
+    // newuidmap and newgidmap don't work on its own user namespace
+    // so create it in separate process and then enter it
     let mut process = Command::new("unshare").args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
-    set_mapping(Mapping::Uid, pid, uid, &username).await.context("Failed to map uid.")?;
+    set_mapping(Mapping::Uid, pid, uid.into(), &username).await.context("Failed to map uid.")?;
     std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups.")?;
-    set_mapping(Mapping::Gid, pid, gid, &username).await.context("Failed to map gid.")?;
+    set_mapping(Mapping::Gid, pid, gid.into(), &username).await.context("Failed to map gid.")?;
 
     // enter the namespace
     let ns_path = format!("/proc/{pid}/ns/user");
@@ -109,11 +109,6 @@ async fn enter_namespace() -> Result<()> {
     } else if let Err(error) = process.wait().await {
         eprintln!("Failed to wait for process {pid} to exit: {error}.");
     }
-
-    unshare(CloneFlags::CLONE_NEWNS).context("Couldn't flag namespace as mount.")?;
-
-    mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
-        .context("Failed to make root a slave mount.")?;
 
     Ok(())
 }
@@ -136,6 +131,7 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
             }
         }
 
+        // TODO: also consider nosuid, nodev, etc.
         let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
         mount(Some(&entry.path()), &target, None::<&str>, flags, None::<&str>)  // mount works with files too
             .context(format!("Failed to bind {entry:?} to {target:?}."))?;
@@ -146,16 +142,30 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
 
 lazy_static::lazy_static! { static ref ROOT: &'static Path = Path::new("/"); }
 
+// TODO: if there are programs in /usr/bin which are in /run/wrappers/bin
+// then bind the latter onto the former
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
+    // TODO: validate entries in fhs_path
+    dbg!(fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()?);
+
+    mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
+        .context("Failed to make root a slave mount.")?;
+
     let new_root = tempfile::TempDir::new()?.into_path();
     mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
 
     bind_entries(fhs_path, &new_root, &["etc"]).await?;
+
+    // TODO: document the privilege escalation concern here
+    // https://unix.stackexchange.com/questions/65039/
     fs::create_dir(new_root.join("etc")).await.context("Failed to create etc in new_root")?;
-    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &[]).await?;
+    bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &["ld.so.conf"]).await?;
+    let to_protect = ["gshadow", "login.defs", "pam.d", "passwd", "shadow", "ssh", "sudoers"];     // hopefully redundant
+    bind_entries(&fhs_path.join("etc"), &new_root.join("etc"), &to_protect).await?;
 
     bind_entries(&ROOT, &new_root, &["etc", "tmp"]).await?;     // TODO: explain why not mount tmp directly
-    bind_entries(&ROOT.join("etc"), &new_root.join("etc"), &[]).await?;
+
+    prepare_env::create_ld_so_conf()?;
 
     Ok(new_root)
 }
@@ -218,7 +228,7 @@ fn enter_shell(cli: Cli) -> Result<()> {
         format!("bash --init-file <(echo \"{}\")", set_ps1.replace("\"", "\\\""))
     });
     let args = [&name, &CString::new("-c")?, &CString::new(entrypoint)?];
-    execvp(&name, &args).context("execvp into bash failed.")?;
+    nix::unistd::execvp(&name, &args).context("execvp into bash failed.")?;
 
     unreachable!();
 }
@@ -237,14 +247,32 @@ struct Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let rootless = Uid::effective() != nix::unistd::ROOT;
+    let (uid, gid) = (Uid::current(), Gid::current());
+    // drop privileges temporarily
+    seteuid(uid)?;
+    setegid(gid)?;
+
     let cli: Cli = clap::Parser::parse();
     let fhs_definition = define_fhs(&cli).await?;
     let fhs_path = get_fhs_path(&fhs_definition).await?;
 
-    enter_namespace().await.context("Couldn't enter namespace.")?;
+    if rootless {
+        enter_user_namespace(uid, gid).await.context("Couldn't enter user namespace.")?;
+    } else {
+        // elevate to root
+        seteuid(0.into())?;
+        setegid(0.into())?;    
+    }
+    // https://unix.stackexchange.com/questions/476847/
+    unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create namespace.")?;
     let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
-    prepare_env::prepare_env()?;
+    // drop privileges again
+    seteuid(uid)?;
+    setegid(gid)?;
+
+    prepare_env::prepare_env();
     enter_shell(cli)
 }

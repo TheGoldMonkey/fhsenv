@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-fn create_ld_so_conf() -> Result<()> {
+pub fn create_ld_so_conf() -> Result<()> {
     let ld_so_conf_entries = [
         "/lib",
         "/lib/x86_64-linux-gnu",
@@ -28,7 +28,7 @@ fn prepend_entries_in_env(key: &str, additions: &[&str]) {
     std::env::set_var(key, additions.join(":") + &val);
 }
 
-pub fn prepare_env() -> Result<()> {
+pub fn prepare_env() {
     prepend_entries_in_env("PATH", &[
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -50,6 +50,4 @@ pub fn prepare_env() -> Result<()> {
     prepend_entries_in_env("PKG_CONFIG_PATH", &["/usr/lib/pkgconfig"]);
     prepend_entries_in_env("LD_LIBRARY_PATH", &["/run/opengl-driver/lib", "/run/opengl-driver-32/lib"]);
     std::env::set_var("LOCALE_ARCHIVE", "/usr/lib/locale/locale-archive");
-
-    create_ld_so_conf()
 }
