@@ -32,11 +32,11 @@ pub fn prepare_env() {
     prepend_entries_in_env("PATH", &[
         "/usr/local/bin",
         "/usr/local/sbin",
+        "/run/wrappers/bin",
         "/usr/bin",
         "/usr/sbin",
         "/bin",
-        "/sbin",
-        "/run/wrappers/bin"
+        "/sbin"
     ]);
 
     prepend_entries_in_env("XDG_DATA_DIRS", &[

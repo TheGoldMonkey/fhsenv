@@ -2,7 +2,6 @@ use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use tokio::process::Command;
 
 mod prepare_env;
 
@@ -11,8 +10,13 @@ lazy_static::lazy_static! {
     static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");    // mitigates malicious $PATH
 }
 
+fn command(program: &str) -> tokio::process::Command {
+    tokio::process::Command::new(BIN.join(program))
+}
+
 async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I) -> Result<String> {
-    let output = Command::new(BIN.join(program)).args(args).output().await?;
+    let output = tokio::process::Command::new(BIN.join(program)).args(args).output().await
+        .context(format!("Error running {program}."))?;
 
     if !output.status.success() {
         bail!("Error running {program}: {}.", String::from_utf8(output.stderr)?);
@@ -39,10 +43,8 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
     // like subprocess but without piping stderr
-    let output = Command::new(BIN.join("nix-store"))
-        .args(["--realise", fhs_drv])
-        .stdout(std::process::Stdio::piped())
-        .spawn()?.wait_with_output().await?;
+    let output = command("nix-store").args(["--realise", fhs_drv])
+        .stdout(std::process::Stdio::piped()).spawn()?.wait_with_output().await?;
     let (output, status) = (std::str::from_utf8(&output.stdout)?.trim(), output.status);
     let fhs_path = Path::new(output);
     if !status.success() || !fhs_path.exists() {
@@ -70,7 +72,7 @@ enum Mapping { Uid, Gid }
 // TODO: there can be multiple ranges for a single user
 fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
-    let subuid = std::fs::read_to_string(path).context(format!("Failed to read {path}."))?;
+    let subuid = fs::read_to_string(path).context(format!("Failed to read {path}."))?;
     for (i, line) in subuid.split('\n').enumerate() {
         let [_username, lower_id, range] = line.split(':').collect::<Vec<_>>()[..] else {
             continue;
@@ -87,6 +89,7 @@ fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
     bail!("{username} has no entry in {path}.");
 }
 
+// https://man7.org/linux/man-pages/man1/newuidmap.1.html
 async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Result<String> {
     let (lower_id, range) = read_subuid(mapping, &username)?;
     let args = [
@@ -101,24 +104,23 @@ async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Re
 }
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
-// https://man7.org/linux/man-pages/man1/newuidmap.1.html
 async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
     let username =
         User::from_uid(uid).unwrap_or(None).ok_or(anyhow!("Failed to get username from uid."))?.name;
 
     // newuidmap and newgidmap don't work on its own user namespace
     // so create it in separate process and then enter it
-    let mut process = Command::new(BIN.join("unshare")).args(&["-U", "sleep", "infinity"]).spawn()
+    let mut process = command("unshare").args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
     set_mapping(Mapping::Uid, pid, uid.into(), &username).await.context("Failed to map uid.")?;
-    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups.")?;
+    fs::write(format!("/proc/{pid}/setgroups"), "deny").context("Couldn't disable setgroups.")?;
     set_mapping(Mapping::Gid, pid, gid.into(), &username).await.context("Failed to map gid.")?;
 
     // enter the namespace
     let ns_path = format!("/proc/{pid}/ns/user");
-    let ns_fd = std::fs::File::open(&ns_path).context(format!("Failed to open {ns_path}."))?;
+    let ns_fd = fs::File::open(&ns_path).context(format!("Failed to open {ns_path}."))?;
     setns(ns_fd, CloneFlags::CLONE_NEWUSER).context(format!("Couldn't enter {ns_path}."))?;
 
     if let Err(error) = signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal::Signal::SIGKILL) {
@@ -193,7 +195,7 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
 async fn pivot_root(new_root: &Path) -> Result<()> {
     let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
     fs::create_dir(new_root.join("tmp")).context("Failed to create tmp in new root")?;
-    std::fs::set_permissions(new_root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o777))
+    fs::set_permissions(new_root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o777))
         .context("Failed to set permissions on tmp")?;
     bind_entries(&ROOT.join("tmp"), &new_root.join("tmp"), &[]).await?;
 
@@ -217,8 +219,7 @@ fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
             bail!("{:?} does not exist.", shell_nix.canonicalize()?);
         }
 
-        std::fs::read_to_string(shell_nix)
-            .context(format!("Failed to read from {shell_nix:?}.")).map_err(Into::into)
+        return Ok(fs::read_to_string(shell_nix).context(format!("Failed to read from {shell_nix:?}."))?);
     } else {
         // TODO: check how nix-shell sanitizes/validates packages input
         let packages_formatted =
@@ -285,11 +286,11 @@ async fn main() -> Result<()> {
         enter_user_namespace(uid, gid).await.context("Couldn't enter user namespace.")?;
     } else {
         // elevate to root
-        seteuid(0.into())?;
-        setegid(0.into())?;
+        seteuid(0.into()).context("Failed to set effective user ID to root")?;
+        setegid(0.into()).context("Failed to set effective group ID to root")?;
     }
     // https://unix.stackexchange.com/questions/476847/
-    unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create namespace.")?;
+    unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create mount namespace.")?;
     let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
