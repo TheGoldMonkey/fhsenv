@@ -10,13 +10,16 @@ lazy_static::lazy_static! {
     static ref BIN: &'static Path = Path::new("/run/current-system/sw/bin");    // mitigates malicious $PATH
 }
 
-fn command(program: &str) -> tokio::process::Command {
-    tokio::process::Command::new(BIN.join(program))
+fn command(program: &str) -> Result<tokio::process::Command> {
+    if Uid::effective() == nix::unistd::ROOT {
+        bail!("Attempted to run subprocess while root.");
+    }
+
+    Ok(tokio::process::Command::new(BIN.join(program)))
 }
 
 async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I) -> Result<String> {
-    let output = tokio::process::Command::new(BIN.join(program)).args(args).output().await
-        .context(format!("Error running {program}."))?;
+    let output = command(program)?.args(args).output().await.context(format!("Error running {program}."))?;
 
     if !output.status.success() {
         bail!("Error running {program}: {}.", String::from_utf8(output.stderr)?);
@@ -43,7 +46,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
     // like subprocess but without piping stderr
-    let output = command("nix-store").args(["--realise", fhs_drv])
+    let output = command("nix-store")?.args(["--realise", fhs_drv])
         .stdout(std::process::Stdio::piped()).spawn()?.wait_with_output().await?;
     let (output, status) = (std::str::from_utf8(&output.stdout)?.trim(), output.status);
     let fhs_path = Path::new(output);
@@ -110,7 +113,7 @@ async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
 
     // newuidmap and newgidmap don't work on its own user namespace
     // so create it in separate process and then enter it
-    let mut process = command("unshare").args(&["-U", "sleep", "infinity"]).spawn()
+    let mut process = command("unshare")?.args(&["-U", "sleep", "infinity"]).spawn()
         .context("Couldn't create namespace.")?;
     let pid = process.id().ok_or(anyhow!("Namespace parent exited prematurely."))?;
 
@@ -132,12 +135,21 @@ async fn enter_user_namespace(uid: Uid, gid: Gid) -> Result<()> {
     Ok(())
 }
 
+// tokio::fs::try_exists equivalent that doesn't traverse symlinks
+async fn exists(path: &Path) -> Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if matches!(error.kind(), tokio::io::ErrorKind::NotFound) => Ok(false),
+        Err(error) => bail!("Failed to determine {path:?}'s existence: {error}.") 
+    }
+}
+
+// target is inside new_root so isolated from outside
+// however entry may be malicious if from fhs_path or /tmp
 // TODO: is there a practical limit on number of bind mounts?
 async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
-    let exists = tokio::fs::try_exists(target).await
-        .context(format!("Failed to determine {target:?}'s existence."))?;
-    if exists {
-        return Ok(());
+    if exists(target).await? {
+        return Ok(());              // do not overwrite existing entry
     }
 
     let metadata = tokio::fs::metadata(entry).await
@@ -148,8 +160,8 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
         tokio::fs::write(&target, "").await.context("Failed to create stub file.")?;
     }
 
-    let flags = MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    mount(Some(entry), target, None::<&str>, flags, None::<&str>)  // mount works with files too
+    let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
+    mount(Some(entry), target, None::<&str>, flags, None::<&str>)       // mount works with files too
         .context(format!("Failed to bind {entry:?} to {target:?}."))
 }
 
@@ -165,9 +177,9 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
     })).await.into_iter().collect()
 }
 
-// mount requires root since it allows the caller to change passwords
+// mount requires root since it allows the caller to overwrite sensitive system files
 // > mount a filesystem of your choice on /etc, with an /etc/shadow containing a root password that you know
-// https://unix.stackexchange.com/questions/65039/
+// from https://unix.stackexchange.com/questions/65039/
 // this is mitigated by giving entries in /etc precedence over those in fhs_path
 // btw normal packages use /run/current-system/sw/etc and /etc only contains system configuration
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
@@ -175,7 +187,7 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
         .context("Failed to make root a slave mount.")?;
 
     let new_root = tempfile::TempDir::new()?.into_path();
-    mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;
+    mount(None::<&str>, &new_root, Some("tmpfs"), MsFlags::empty(), None::<&str>)?;     // isolates new_root
 
     bind_entries(fhs_path, &new_root, &["etc"]).await?;
 
@@ -191,7 +203,6 @@ async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
     Ok(new_root)
 }
 
-// TODO: why does mktemp fail after pivot_root?
 async fn pivot_root(new_root: &Path) -> Result<()> {
     let put_old = new_root.join(tempfile::TempDir::new()?.into_path().strip_prefix("/")?);
     fs::create_dir(new_root.join("tmp")).context("Failed to create tmp in new root")?;
@@ -234,6 +245,7 @@ fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
     }
 }
 
+// TODO: how does nix-shell do this?
 fn enter_shell(entrypoint: Option<String>) -> Result<()> {
     let name = CString::new("bash")?;               // TODO: use the default shell rather than bash
     let entrypoint = entrypoint.unwrap_or_else(|| {

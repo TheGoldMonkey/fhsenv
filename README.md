@@ -25,7 +25,7 @@ Examples:
 - `fhsenv --run 'sudo whoami'`: demonstrates sudo functionality, which is broken in the official implementation.
 
 ## Installation
-<span style='color: red'>Caution</span>: It's not recommended to install SUID programs when the author isn't a cybersecurity expert. I however have convinced both myself and o1-preview that privilege escalation is effectively mitigated.
+Caution: It's not recommended to install SUID programs when not authored by a cybersecurity expert. I however have convinced both myself and [o1-preview](https://chatgpt.com/share/67393c45-24a4-8010-a94c-4813d0f08488) that privilege escalation is effectively mitigated.
 
 1) Declare the fhsenv package either in flake.nix or using callPackage with fetchFromGitHub.
 2) Add fhsenv to environment.systemPackages.
