@@ -72,38 +72,67 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
 #[derive(Clone, Copy)]
 enum Mapping { Uid, Gid }
 
-// TODO: there can be multiple ranges for a single user
-fn read_subuid(mapping: Mapping, username: &str) -> Result<(u32, u32)> {
+fn read_subuid(mapping: Mapping, username: &str) -> Result<Vec<(u32, u32)>> {
     let path = match mapping { Mapping::Uid => "/etc/subuid", Mapping::Gid => "/etc/subgid" };
-    let subuid = fs::read_to_string(path).context(format!("Failed to read {path}."))?;
+    let subuid = match fs::read_to_string(path) {
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => return Ok(vec![]),
+        result => result.context(format!("Failed to read {path}."))?
+    };
+    let mut ranges = vec![];
     for (i, line) in subuid.split('\n').enumerate() {
-        let [_username, lower_id, range] = line.split(':').collect::<Vec<_>>()[..] else {
+        let [_username, lower_id, count] = line.split(':').collect::<Vec<_>>()[..] else {
             continue;
         };
 
         if _username == username {
-            return Ok((
+            ranges.push((
                 lower_id.parse().context(format!("{path} line {i}: invalid lower_id."))?,
-                range.parse().context(format!("{path} line {i}: invalid range."))?,
+                count.parse().context(format!("{path} line {i}: invalid count."))?,
             ));
         }
     }
 
-    bail!("{username} has no entry in {path}.");
+    ranges.sort();
+    Ok(ranges)
 }
 
 // https://man7.org/linux/man-pages/man1/newuidmap.1.html
 async fn set_mapping(mapping: Mapping, pid: u32, uid: u32, username: &str) -> Result<String> {
-    let (lower_id, range) = read_subuid(mapping, &username)?;
-    let args = [
-        pid,
-        0, lower_id, uid,
-        uid, uid, 1,
-        uid + 1, lower_id + uid, range - uid
-    ];
+    let mut ranges = read_subuid(mapping, &username)?.into_iter();
+    let mut counter = 0;
+    let mut args = vec![pid];
+    let mut overlapping_range = None;
 
-    let mapper = match mapping { Mapping::Uid => "newuidmap", Mapping::Gid => "newgidmap" };
-    subprocess(mapper, args.iter().map(u32::to_string).into_iter()).await
+    while let Some((lower_id, count)) = ranges.next() {
+        if counter + count > uid {
+            overlapping_range = Some((lower_id, count));
+            break;
+        } else {
+            args.extend([counter, lower_id, count]);
+        }
+        counter += count;
+    }
+
+    if let Some((lower_id, count)) = overlapping_range {
+        let fst_count = uid - counter;
+        if fst_count > 0 {
+            args.extend([counter, lower_id, fst_count]);
+        }
+        args.extend([uid, uid, 1]);
+        args.extend([uid + 1, lower_id + fst_count, count - fst_count]);
+        counter += count;
+
+        for (lower_id, count) in ranges {
+            args.extend([counter, lower_id, count]);
+            counter += count;
+        }
+    } else {
+        args.extend([uid, uid, 1]);
+    }
+
+    let mapper = "/run/wrappers/bin/".to_string() +
+        match mapping { Mapping::Uid => "newuidmap", Mapping::Gid => "newgidmap" };
+    subprocess(&mapper, args.iter().map(u32::to_string).into_iter()).await
 }
 
 // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
@@ -167,14 +196,14 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
 
 // asynchronously loop over bind_entry
 async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<Vec<()>> {
-    futures::future::join_all(parent.read_dir()?.map(|result| async move {
+    futures::future::try_join_all(parent.read_dir()?.map(|result| async move {
         let entry = result?;
         if exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
             Ok(())
         } else {
             bind_entry(&entry.path(), &target.join(entry.file_name())).await
         }
-    })).await.into_iter().collect()
+    })).await
 }
 
 // mount requires root since it allows the caller to overwrite sensitive system files
