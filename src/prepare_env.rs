@@ -46,8 +46,16 @@ pub fn prepare_env() {
         "/run/opengl-driver-32/share"
     ]);
 
+    prepend_entries_in_env("LD_LIBRARY_PATH", &[
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib",
+        "/lib64",
+        "/run/opengl-driver/lib",
+        "/run/opengl-driver-32/lib"
+    ]);
+
     prepend_entries_in_env("ACLOCAL_PATH", &["/usr/share/aclocal"]);
     prepend_entries_in_env("PKG_CONFIG_PATH", &["/usr/lib/pkgconfig"]);
-    prepend_entries_in_env("LD_LIBRARY_PATH", &["/run/opengl-driver/lib", "/run/opengl-driver-32/lib"]);
     std::env::set_var("LOCALE_ARCHIVE", "/usr/lib/locale/locale-archive");
 }
