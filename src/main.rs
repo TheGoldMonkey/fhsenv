@@ -282,7 +282,7 @@ fn enter_shell(entrypoint: Option<String>) -> Result<()> {
         let ps1 = r"\[\e[1;32m\]\u \W> \[\e[0m\]";
         let set_ps1 = format!("export PS1=\"{ps1}\"");
         // https://serverfault.com/questions/368054/
-        format!("bash --init-file <(echo \"{}\")", set_ps1.replace("\"", "\\\""))
+        format!("bash --init-file <(echo \"source ~/.bashrc; {}\")", set_ps1.replace("\"", "\\\""))
     });
     let args = [&name, &CString::new("-c")?, &CString::new(entrypoint)?];
     nix::unistd::execvp(&name, &args).context("execvp into bash failed.")?;

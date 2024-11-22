@@ -1,6 +1,6 @@
 # fhsenv
 
-fhsenv brings packages into the conventional Linux filesystem hierarchy standard (FHS) folders. For example, an FHS environment with the `clang`, `clang-tools`, `eigen`, and `libcxx.dev` packages results in the following /usr/include:
+fhsenv is a Rust dev-tool to install Nix packages into an FHS-compliant virtual shell. For example, an FHS environment with the `clang`, `clang-tools`, `eigen`, and `libcxx.dev` packages results in the following /usr/include:
 - `c++/v1/`
 - `eigen3/`
 - `gawkapi.h`
