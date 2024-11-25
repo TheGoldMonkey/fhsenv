@@ -41,7 +41,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
         bail!("Couldn't parse derivation for FHS store path.");
     };
-    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhs.drv", regex::escape(fhsenv_name)))?;
+    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhsenv-rootfs.drv", regex::escape(fhsenv_name)))?;
     let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
 
