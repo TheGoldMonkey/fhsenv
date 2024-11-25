@@ -54,7 +54,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     if !status.success() || !fhs_path.exists() {
         bail!("Error building {fhs_drv}.");
     }
-    let pattern = regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhs$", regex::escape(fhsenv_name)))?;
+    let pattern = regex::Regex::new(&format!(r"^/nix/store/([^-]+)-{}-fhsenv-rootfs$", regex::escape(fhsenv_name)))?;
     if pattern.find(&output).is_none() {
         bail!("Invalid output from nix-store --realise {fhs_drv}: {output}.");
     }
