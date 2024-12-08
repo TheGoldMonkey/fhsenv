@@ -60,7 +60,7 @@ async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
     }
 
     // toctou is mitigated by nix store being a read only filesystem
-    let entries_expected = ["bin", "etc", "lib", "lib64", "sbin", "usr", "libexec"];
+    let entries_expected = ["bin", "etc", "lib", "lib32", "lib64", "sbin", "usr", "libexec"];
     for entry in fhs_path.read_dir()?.collect::<Result<Vec<_>, _>>()? {
         if !entries_expected.iter().any(|expected| Some(expected) == entry.file_name().to_str().as_ref()) {
             bail!("Unexpected subdirectory in {fhs_path:?}: {entry:?}.");
