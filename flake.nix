@@ -2,7 +2,8 @@
   description = "buildFHSUserEnv reimplemented.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs/master";
+    # nixpkgs.url = "github:NixOS/nixpkgs/master";
+    nixpkgs.url = "/home/mcvm/dev/nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
 
