@@ -1,1 +1,3 @@
-#!MCVM nix build
+#!MCVM cargo run -- test2/
+#!MCVM cargo build
+#!MCVM nix run . -- test/shell.nix

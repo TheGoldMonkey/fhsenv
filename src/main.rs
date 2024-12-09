@@ -1,7 +1,9 @@
-use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
+// #!MCVM cargo run -- test2/
+use std::{backtrace, ffi::{CString, OsStr}, fs, path::{Path, PathBuf}};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use std::backtrace::Backtrace;
 
 mod prepare_env;
 
@@ -11,9 +13,9 @@ lazy_static::lazy_static! {
 }
 
 fn command(program: &str) -> Result<tokio::process::Command> {
-    if Uid::effective() == nix::unistd::ROOT {
-        bail!("Attempted to run subprocess while root.");
-    }
+    // if Uid::effective() == nix::unistd::ROOT {
+    //     bail!("Attempted to run subprocess while root.");
+    // }
 
     Ok(tokio::process::Command::new(BIN.join(program)))
 }
@@ -30,21 +32,37 @@ async fn subprocess<I: IntoIterator<Item: AsRef<OsStr>>>(program: &str, args: I)
 
 // TODO: handle the case where fhs_derivation doesn't actually evaluate to buildFHSUserEnv.env
 async fn get_fhs_path(fhs_definition: &str) -> Result<PathBuf> {
-    let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
+    println!("{}", fhs_definition);
+    
+    // let derivation_path = subprocess("nix-instantiate", ["-E", &fhs_definition]).await?;
+    let derivation_path = subprocess("nix", ["path-info","--derivation", fhs_definition]).await?;
+    println!("{}", derivation_path);
+
     let output = subprocess("nix", ["derivation", "show", &derivation_path]).await?;
     let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
-
-    let pattern = regex::Regex::new(r"^(.*)-shell-env$")?;
+    println!("{}", output);
+    let pattern = regex::Regex::new(r"^(.+)$")?;
     let fhsenv_name = &pattern.captures(derivation[&derivation_path]["name"].as_str().unwrap_or_default())
         .ok_or(anyhow!("Couldn't parse derivation for environment name."))?[1];
-
     let serde_json::Value::Object(input_drvs) = &derivation[&derivation_path]["inputDrvs"] else {
         bail!("Couldn't parse derivation for FHS store path.");
     };
-    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-fhsenv-rootfs.drv", regex::escape(fhsenv_name)))?;
 
+    println!("{}", fhsenv_name);
+    let pattern = regex::Regex::new(&format!(r"/nix/store/([^-]+)-{}-bwrap.drv", regex::escape(fhsenv_name)))?;
     let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
         .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
+    let output = subprocess("nix", ["derivation", "show", &fhs_drv]).await?;
+    let derivation = serde_json::from_str::<serde_json::Value>(&output)?;
+    println!("{}", output);
+    let pattern = regex::Regex::new(r"^(.+)-fhsenv-rootfs.drv$")?;
+    let serde_json::Value::Object(input_drvs) = &derivation[&fhs_drv]["inputDrvs"] else {
+        bail!("222222222 derivation for FHS store path.");
+    };
+    let fhs_drv = input_drvs.keys().filter_map(|input_drv| pattern.find(input_drv)).next()
+        .ok_or(anyhow!("Expected FHS derivation in inputDrvs."))?.as_str();
+
+    println!("{}", output);
 
     // like subprocess but without piping stderr
     let output = command("nix-store")?.args(["--realise", fhs_drv])
@@ -181,8 +199,9 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
     if exists(target).await? {
         return Ok(());              // do not overwrite existing entry
     }
-
+    
     let metadata = tokio::fs::metadata(entry).await
+    // .or(tokio::fs::symlink_metadata(entry).await)
         .context(format!("Failed to query {entry:?}'s metadata."))?;
     if metadata.is_dir() {
         tokio::fs::create_dir(&target).await.context("Failed to create stub directory.")?;
@@ -197,6 +216,8 @@ async fn bind_entry(entry: &Path, target: &Path) -> Result<()> {
 
 // asynchronously loop over bind_entry
 async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Result<Vec<()>> {
+    println!("{}", parent.to_str().unwrap());
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
     futures::future::try_join_all(parent.read_dir()?.map(|result| async move {
         let entry = result?;
         if exclusions.into_iter().any(|exclusion| entry.file_name().to_str() == Some(exclusion)) {
@@ -204,7 +225,7 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
         } else {
             bind_entry(&entry.path(), &target.join(entry.file_name())).await
         }
-    })).await
+    })).await.context(bt)
 }
 
 // mount requires root since it allows the caller to overwrite sensitive system files
@@ -213,6 +234,7 @@ async fn bind_entries(parent: &Path, target: &Path, exclusions: &[&str]) -> Resu
 // this is mitigated by giving entries in /etc precedence over those in fhs_path
 // btw normal packages use /run/current-system/sw/etc and /etc only contains system configuration
 async fn create_new_root(fhs_path: &Path) -> Result<PathBuf> {
+    println!("{}", fhs_path.to_str().unwrap());
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_SLAVE | MsFlags::MS_REC, None::<&str>)
         .context("Failed to make root a slave mount.")?;
 
@@ -258,6 +280,11 @@ fn define_fhs(Mode { shell_nix, packages }: Mode) -> Result<String> {
         let shell_nix = shell_nix.as_ref().map(PathBuf::as_path).unwrap_or(Path::new("./shell.nix"));
         if !shell_nix.exists() {
             bail!("{:?} does not exist.", shell_nix.canonicalize()?);
+        }
+        println!("{}", shell_nix.to_str().unwrap());
+
+        if fs::metadata(shell_nix).unwrap().is_dir() {
+            return Ok(shell_nix.to_str().unwrap().into());
         }
 
         return Ok(fs::read_to_string(shell_nix).context(format!("Failed to read from {shell_nix:?}."))?);
@@ -333,6 +360,7 @@ async fn main() -> Result<()> {
     }
     // https://unix.stackexchange.com/questions/476847/
     unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create mount namespace.")?;
+
     let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
     pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 

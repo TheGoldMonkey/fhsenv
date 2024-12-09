@@ -1,0 +1,105 @@
+{
+  "/nix/store/7dyrfbb2wqz6jf7gqb7dr18cpsbjr2qv-c++-environment-w-clangd2-shell-env.drv": {
+    "args": [
+      "-e",
+      "/nix/store/v6x3cs394jgqfbi0a42pam708flxaphh-default-builder.sh"
+    ],
+    "builder": "/nix/store/p6k7xp1lsfmbdd731mlglrdj2d66mr82-bash-5.2p37/bin/bash",
+    "env": {
+      "__structuredAttrs": "",
+      "allowSubstitutes": "",
+      "buildCommand": "echo >&2 \"\"\necho >&2 \"*** User chroot 'env' attributes are intended for interactive nix-shell sessions, not for building! ***\"\necho >&2 \"\"\nexit 1\n",
+      "buildInputs": "",
+      "builder": "/nix/store/p6k7xp1lsfmbdd731mlglrdj2d66mr82-bash-5.2p37/bin/bash",
+      "cmakeFlags": "",
+      "configureFlags": "",
+      "depsBuildBuild": "",
+      "depsBuildBuildPropagated": "",
+      "depsBuildTarget": "",
+      "depsBuildTargetPropagated": "",
+      "depsHostHost": "",
+      "depsHostHostPropagated": "",
+      "depsTargetTarget": "",
+      "depsTargetTargetPropagated": "",
+      "doCheck": "",
+      "doInstallCheck": "",
+      "enableParallelBuilding": "1",
+      "enableParallelChecking": "1",
+      "enableParallelInstalling": "1",
+      "mesonFlags": "",
+      "name": "c++-environment-w-clangd2-shell-env",
+      "nativeBuildInputs": "",
+      "out": "/nix/store/sycgy0gkvcdjhlqamwr9hg7mmpkwn45i-c++-environment-w-clangd2-shell-env",
+      "outputs": "out",
+      "passAsFile": "buildCommand",
+      "patches": "",
+      "preferLocalBuild": "1",
+      "propagatedBuildInputs": "",
+      "propagatedNativeBuildInputs": "",
+      "shellHook": "ignored=(/nix /dev /proc /etc )\nro_mounts=()\nsymlinks=()\netc_ignored=()\n\n\n\n# loop through all entries of root in the fhs environment, except its /etc.\nfor i in /nix/store/r83hfqhf1pyfmr7r1h27fhnkx1migwyc-c++-environment-w-clangd2-fhsenv-rootfs/*; do\n  path=\"/${i##*/}\"\n  if [[ $path == '/etc' ]]; then\n    :\n  elif [[ -L $i ]]; then\n    symlinks+=(--symlink \"$(/nix/store/b1wvkjx96i3s7wblz38ya0zr8i93zbc5-coreutils-9.5/bin/readlink \"$i\")\" \"$path\")\n    ignored+=(\"$path\")\n  else\n    ro_mounts+=(--ro-bind \"$i\" \"$path\")\n    ignored+=(\"$path\")\n  fi\ndone\n\n# loop through the entries of /etc in the fhs environment.\nif [[ -d /nix/store/r83hfqhf1pyfmr7r1h27fhnkx1migwyc-c++-environment-w-clangd2-fhsenv-rootfs/etc ]]; then\n  for i in /nix/store/r83hfqhf1pyfmr7r1h27fhnkx1migwyc-c++-environment-w-clangd2-fhsenv-rootfs/etc/*; do\n    path=\"/${i##*/}\"\n    # NOTE: we're binding /etc/fonts and /etc/ssl/certs from the host so we\n    # don't want to override it with a path from the FHS environment.\n    if [[ $path == '/fonts' || $path == '/ssl' ]]; then\n      continue\n    fi\n    if [[ -L $i ]]; then\n      symlinks+=(--symlink \"$i\" \"/etc$path\")\n    else\n      ro_mounts+=(--ro-bind \"$i\" \"/etc$path\")\n    fi\n    etc_ignored+=(\"/etc$path\")\n  done\nfi\n\n# propagate /etc from the actual host if nested\nif [[ -e /.host-etc ]]; then\n  ro_mounts+=(--ro-bind /.host-etc /.host-etc)\nelse\n  ro_mounts+=(--ro-bind /etc /.host-etc)\nfi\n\n# link selected etc entries from the actual root\nfor i in /etc/static /etc/nix /etc/shells /etc/bashrc /etc/zshenv /etc/zshrc /etc/zinputrc /etc/zprofile /etc/passwd /etc/group /etc/shadow /etc/hosts /etc/resolv.conf /etc/nsswitch.conf /etc/profiles /etc/login.defs /etc/sudoers /etc/sudoers.d /etc/localtime /etc/zoneinfo /etc/machine-id /etc/os-release /etc/pam.d /etc/fonts /etc/alsa /etc/asound.conf /etc/ssl/certs /etc/ca-certificates /etc/pki; do\n  if [[ \"${etc_ignored[@]}\" =~ \"$i\" ]]; then\n    continue\n  fi\n  if [[ -e $i ]]; then\n    symlinks+=(--symlink \"/.host-etc/${i#/etc/}\" \"$i\")\n  fi\ndone\n\ndeclare -a auto_mounts\n# loop through all directories in the root\nfor dir in /*; do\n  # if it is a directory and it is not ignored\n  if [[ -d \"$dir\" ]] && [[ ! \"${ignored[@]}\" =~ \"$dir\" ]]; then\n    # add it to the mount list\n    auto_mounts+=(--bind \"$dir\" \"$dir\")\n  fi\ndone\n\ndeclare -a x11_args\n# Always mount a tmpfs on /tmp/.X11-unix\n# Rationale: https://github.com/flatpak/flatpak/blob/be2de97e862e5ca223da40a895e54e7bf24dbfb9/common/flatpak-run.c#L277\nx11_args+=(--tmpfs /tmp/.X11-unix)\n\n# Try to guess X socket path. This doesn't cover _everything_, but it covers some things.\nif [[ \"$DISPLAY\" == *:* ]]; then\n  # recover display number from $DISPLAY formatted [host]:num[.screen]\n  display_nr=${DISPLAY/#*:} # strip host\n  display_nr=${display_nr/%.*} # strip screen\n  local_socket=/tmp/.X11-unix/X$display_nr\n  x11_args+=(--ro-bind-try \"$local_socket\" \"$local_socket\")\nfi\n\n\n\ncmd=(\n  /nix/store/0bzql6l5iw3didwv8lwib3yy5abdzzpc-bubblewrap-0.11.0/bin/bwrap\n  --dev-bind /dev /dev\n  --proc /proc\n  --chdir \"$(pwd)\"\n  \n  \n  \n  \n  \n  \n  --die-with-parent\n  --ro-bind /nix /nix\n  \n  # Our glibc will look for the cache in its own path in `/nix/store`.\n  # As such, we need a cache to exist there, because pressure-vessel\n  # depends on the existence of an ld cache. However, adding one\n  # globally proved to be a bad idea (see #100655), the solution we\n  # settled on being mounting one via bwrap.\n  # Also, the cache needs to go to both 32 and 64 bit glibcs, for games\n  # of both architectures to work.\n  --tmpfs /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc \\\n  --tmpfs /etc \\\n  --symlink /etc/ld.so.conf /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc/ld.so.conf \\\n  --symlink /etc/ld.so.cache /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc/ld.so.cache \\\n  --ro-bind /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc/rpc /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc/rpc \\\n  --remount-ro /nix/store/wn7v2vhyyyi6clcyn0s9ixvl7d4d87ic-glibc-2.40-36/etc \\\n  --symlink /nix/store/1yc9lf7xngjgrqm894k399lc466lhiz0-c++-environment-w-clangd2-init /init \\\n  \"${ro_mounts[@]}\"\n  \"${symlinks[@]}\"\n  \"${auto_mounts[@]}\"\n  \"${x11_args[@]}\"\n  \n  /nix/store/63yzv2gi1l0jqr19xvlw5z2q986a5h1s-container-init \n)\nexec \"${cmd[@]}\"\n",
+      "stdenv": "/nix/store/spb2bpcnw0gbbr4x94cq8xs9n72hipwj-stdenv-linux",
+      "strictDeps": "",
+      "system": "x86_64-linux"
+    },
+    "inputDrvs": {
+      "/nix/store/5bkb5gj6x8sggnb0h05iji8mzpq5lwp3-c++-environment-w-clangd2-fhsenv-rootfs.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/bqiaidimf8sl1102aq7012m3k21grrac-c++-environment-w-clangd2-init.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/i3yqc3ihd3y2xzcp21x2s0c66ii1m2nh-bubblewrap-0.11.0.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/iiaigdlangp550wd1k2n30999r6qg2mb-container-init.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/qhdvi3qcn60vrapyhsxxpbw0q63gmfz8-glibc-2.40-36.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/s63zivn27i8qv5cqiy8r5hf48r323qwa-bash-5.2p37.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/ws0w1jw9y3wwmvm305m18ivjil4nayls-stdenv-linux.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      },
+      "/nix/store/z976lw72v1xrnqy27b554xrb02szjhlh-coreutils-9.5.drv": {
+        "dynamicOutputs": {},
+        "outputs": [
+          "out"
+        ]
+      }
+    },
+    "inputSrcs": [
+      "/nix/store/v6x3cs394jgqfbi0a42pam708flxaphh-default-builder.sh"
+    ],
+    "name": "c++-environment-w-clangd2-shell-env",
+    "outputs": {
+      "out": {
+        "path": "/nix/store/sycgy0gkvcdjhlqamwr9hg7mmpkwn45i-c++-environment-w-clangd2-shell-env"
+      }
+    },
+    "system": "x86_64-linux"
+  }
+}

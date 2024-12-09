@@ -1,0 +1,26 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1733379635,
+        "narHash": "sha256-QGmgFcRSP0xzKeHiXTyuIfWYxCayqDlDBRHR4ajnUnI=",
+        "ref": "refs/heads/master",
+        "rev": "ad5c52a8c3f02d139c36c25c2d7ccd5184baeb8e",
+        "revCount": 716979,
+        "type": "git",
+        "url": "file:///home/mcvm/dev/nixpkgs"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:///home/mcvm/dev/nixpkgs"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
