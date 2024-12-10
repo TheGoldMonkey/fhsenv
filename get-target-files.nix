@@ -1,4 +1,4 @@
-#!MCVM nix build
+#!MCVM nix build -L --verbose && ./result/bin/runner
 {
   lib,
   stdenv,
@@ -261,10 +261,9 @@ let
       ''}
 
       cmd=(
-        # --dev-bind /dev /dev
-        # --proc /proc
-        # --chdir "$(pwd)"
-
+        --dev-bind /dev /dev
+        --proc /proc
+        --chdir "$(pwd)"
         --ro-bind /nix /nix
         ${optionalString privateTmp "--tmpfs /tmp"}
         # Our glibc will look for the cache in its own path in `/nix/store`.

@@ -1,4 +1,3 @@
-#!MCVM nix build -L --verbose && ./result/bin/runner
 {
   nixpkgs ? <nixpkgs>,
   pkgs ? import nixpkgs { },
@@ -19,7 +18,10 @@ pkgs.writeShellScriptBin "runner" ''
 #   echo "$line"
 # done
 
-export PIVOTER_ARGS="${argmakerExec}"
-${pivoter} "''$@"
+export PIVOTER_ARGS="$(${argmakerExec})"
+echo "''$PIVOTER_ARGS"
+# ''${pivoter} "''$@"
 ''
 
+
+#${pivoter} "''$@"

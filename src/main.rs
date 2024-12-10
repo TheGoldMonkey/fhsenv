@@ -1,4 +1,4 @@
-use std::{fs, ffi::{CString, OsStr}, path::{Path, PathBuf}};
+use std::{ffi::{CString, OsStr}, fs, path::{Path, PathBuf}, vec};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::{sched::{setns, unshare, CloneFlags}, sys::signal, unistd::{seteuid, setegid, Gid, Uid, User}};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -313,13 +313,18 @@ struct Mode {
 async fn main() -> Result<()> {
     let rootless = Uid::effective() != nix::unistd::ROOT;
     let (uid, gid) = (Uid::current(), Gid::current());
+    let args = std::env::var("PIVOTER_ARGS").unwrap();
+
+
+    
+    // println!("{}", std::env::var("PIVOTER_ARGS").unwrap());
     // drop privileges temporarily
     seteuid(uid)?;
     setegid(gid)?;
 
-    let cli: Cli = clap::Parser::parse();
-    let fhs_definition = define_fhs(cli.mode)?;
-    let fhs_path = get_fhs_path(&fhs_definition).await?;
+    // let cli: Cli = clap::Parser::parse();
+    // let fhs_definition = define_fhs(cli.mode)?;
+    // let fhs_path = get_fhs_path(&fhs_definition).await?;
 
     if rootless {
         // this carries all the drawbacks of the bubblewrap implementation
@@ -332,13 +337,73 @@ async fn main() -> Result<()> {
     }
     // https://unix.stackexchange.com/questions/476847/
     unshare(CloneFlags::CLONE_NEWNS).context("Couldn't create mount namespace.")?;
-    let new_root = create_new_root(&fhs_path).await.context("Couldn't create new_root")?;
-    pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
+    // let new_root = create_new_root().await.context("Couldn't create new_root")?;
+    let new_root = tempfile::TempDir::new()?.into_path();
+
+    for cmd in args.split("--") {
+        if cmd.len() == 0 {
+            continue;
+        }
+        let spl = cmd.split(" ").filter(|s| s.len() > 0).collect::<Vec<_>>();
+        let cmdd = spl[0];
+        match cmdd {
+            "dev-bind" => {
+                assert!(spl.len() == 3, "{}", cmd);
+                println!("{}", cmd);
+                let src = spl[1];
+                let tgt = spl[2];
+                let flags = MsFlags::MS_BIND;
+                mount(Some(src), tgt, None::<&str>, flags, None::<&str>).unwrap();
+            },
+            "proc" => {
+                assert!(spl.len() == 2, "{}", cmd);
+                println!("{}", cmd);
+
+            },
+            "chdir" => {
+                assert!(spl.len() == 2, "{}", cmd);
+                println!("{}", cmd);
+
+            },
+            "ro-bind" => {
+                assert!(spl.len() == 3, "{}", cmd);
+                println!("{}", cmd);
+                let flags = MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY;
+                let mut curr_root = new_root.clone();
+                curr_root.push("d");
+                println!("{}", curr_root.to_str().unwrap());
+                
+                mount(Some(&curr_root), spl[2], None::<&str>, flags, None::<&str>).unwrap();
+            },
+            "tmpfs" => {
+                assert!(spl.len() == 2, "{}", cmd);
+                println!("{}", cmd);
+            },
+            "symlink" => {
+                assert!(spl.len() == 3, "{}", cmd);
+                println!("{}", cmd);
+            },
+            "remount-ro" => {
+                assert!(spl.len() == 2, "{}", cmd);
+                println!("{}", cmd);
+            },
+            "bind" => {
+                assert!(spl.len() == 3, "{}", cmd);
+                println!("{}", cmd);
+            },
+            _ => {
+                println!("ignoring {}", cmd);
+            },
+        };
+    }
+    // pivot_root(&new_root).await.context(format!("Couldn't pivot root to {new_root:?}."))?;
 
     // drop privileges again
     seteuid(uid)?;
     setegid(gid)?;
 
     prepare_env::prepare_env();
-    enter_shell(cli.run)
+    // enter_shell(cli.run)
+    // enter_shell(None)
+    anyhow::Ok(())
 }

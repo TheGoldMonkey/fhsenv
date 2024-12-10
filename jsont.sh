@@ -42,6 +42,8 @@
 
 
 
-./result/bin/DDDDDEVVV | while IFS= read -r -d ' ' line; do
-  echo "$line"
-done
+# ./result/bin/DDDDDEVVV | while IFS= read -r -d ' ' line; do
+#   echo "$line"
+# done
+
+"$(/nix/store/xf1a7m51w3w7lrhkkdzz39wm6d8qbsi5-argmaker/bin/argmaker)"
