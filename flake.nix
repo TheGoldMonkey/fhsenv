@@ -1,3 +1,4 @@
+#!MCVM nix build
 {
   description = "buildFHSUserEnv reimplemented.";
 
@@ -21,7 +22,7 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        fhsenv = (import ./default.nix) { inherit pkgs; };
+      fhsenv = (import ./default.nix) { inherit pkgs; inherit nixpkgs; };
       in {
         packages.default = fhsenv;
         devShells.default = fhsenv;

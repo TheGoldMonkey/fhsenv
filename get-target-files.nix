@@ -1,3 +1,4 @@
+#!MCVM nix build
 {
   lib,
   stdenv,
@@ -11,6 +12,7 @@
 }:
 
 {
+  nixpkgs,
   runScript ? "bash",
   nativeBuildInputs ? [ ],
   extraInstallCommands ? "",
@@ -52,7 +54,7 @@ let
     ]
   ) args;
 
-  buildFHSEnv = callPackage ./buildFHSEnv.nix { };
+  buildFHSEnv = callPackage "${nixpkgs}/pkgs/build-support/build-fhsenv-bubblewrap/buildFHSEnv.nix" {};
 
   fhsenv = buildFHSEnv (
     removeAttrs args [
@@ -142,7 +144,7 @@ let
         buildInputs = [ stdenv.cc.libc.static or null ];
       }
       ''
-        $CXX -static -s -o $out ${./container-init.cc}
+        $CXX -static -s -o $out ${"${nixpkgs}/pkgs/build-support/build-fhsenv-bubblewrap/container-init.cc"}
       '';
 
   realInit =
